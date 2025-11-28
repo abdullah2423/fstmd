@@ -1,0 +1,22 @@
+__pycache__/
+.pytest_cache/
+.mypy_cache/
+.benchmarks/
+dist/
+build/
+*.egg-info
+*.pyc
+*.pyd
+*.pyo
+
+# Virtual envs
+venv/
+.env/
+
+# IDE folders
+.vscode/
+.idea/
+
+# OS files
+.DS_Store
+Thumbs.db

@@ -1,0 +1,109 @@
+[build-system]
+requires = ["setuptools >= 77.0.3"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "fstmd"
+version = "1.0.0"
+description = "Finite-State Markdown Engine - O(N) single-pass Markdown to HTML converter using pure FST"
+readme = "README.md"
+license = "MIT"
+requires-python = ">=3.13"
+authors = [
+    {name = "FSTMD Contributors", email = "fstmd@example.com"}
+]
+maintainers = [
+    {name = "FSTMD Contributors", email = "fstmd@example.com"}
+]
+keywords = [
+    "markdown",
+    "html",
+    "parser",
+    "finite-state-transducer",
+    "fst",
+    "mealy-machine",
+    "performance",
+    "zero-dependencies"
+]
+classifiers = [
+    "Development Status :: 5 - Production/Stable",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.13",
+    "Programming Language :: Python :: 3.14",
+    "Topic :: Text Processing :: Markup :: Markdown",
+    "Topic :: Text Processing :: Markup :: HTML",
+    "Typing :: Typed"
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0.0",
+    "pytest-benchmark>=4.0.0",
+    "ruff>=0.4.0",
+    "mypy>=1.10.0"
+]
+benchmark = [
+    "markdown>=3.6",
+    "commonmark>=0.9.1",
+    "markdown-it-py>=3.0.0"
+]
+
+[project.urls]
+Homepage = "https://github.com/fstmd/fstmd"
+Documentation = "https://github.com/fstmd/fstmd#readme"
+Repository = "https://github.com/fstmd/fstmd.git"
+Issues = "https://github.com/fstmd/fstmd/issues"
+Changelog = "https://github.com/fstmd/fstmd/blob/main/CHANGELOG.md"
+
+[project.scripts]
+fstmd = "fstmd.__main__:main"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["fstmd*"]
+
+[tool.setuptools.package-data]
+fstmd = ["py.typed"]
+
+[tool.ruff]
+target-version = "py313"
+line-length = 100
+
+[tool.ruff.lint]
+select = [
+    "E",
+    "F",
+    "W",
+    "I",
+    "N",
+    "UP",
+    "B",
+    "A",
+    "C4",
+    "PT",
+    "SIM",
+    "TCH",
+    "RUF"
+]
+ignore = ["E501"]
+
+[tool.mypy]
+python_version = "3.13"
+strict = true
+warn_return_any = true
+warn_unused_configs = true
+disallow_untyped_defs = true
+disallow_incomplete_defs = true
+check_untyped_defs = true
+no_implicit_optional = true
+warn_redundant_casts = true
+warn_unused_ignores = true
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+python_files = ["test_*.py"]
+python_functions = ["test_*"]
+addopts = "-v --tb=short"
