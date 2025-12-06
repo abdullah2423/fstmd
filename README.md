@@ -44,14 +44,25 @@ print(html)
 
 ## Supported Markdown Features
 
+### Block Elements
+
+| Feature | Syntax | Output |
+|---------|--------|--------|
+| Paragraphs | Blank line separated | `<p>...</p>` |
+| Headings | `# H1` to `###### H6` | `<h1>` to `<h6>` |
+| Unordered Lists | `- item` | `<ul><li>item</li></ul>` |
+| Blockquotes | `> quote` | `<blockquote>...</blockquote>` |
+| Nested Blockquotes | `>> nested` | Nested `<blockquote>` elements |
+| Fenced Code Blocks | ` ``` ` | `<pre><code>...</code></pre>` |
+
+### Inline Elements
+
 | Feature | Syntax | Output |
 |---------|--------|--------|
 | Bold | `**text**` | `<strong>text</strong>` |
 | Italic | `*text*` | `<em>text</em>` |
 | Bold+Italic | `***text***` | `<strong><em>text</em></strong>` |
-| Headings | `# H1` to `###### H6` | `<h1>` to `<h6>` |
-| Unordered Lists | `- item` | `<ul><li>item</li></ul>` |
-| Paragraphs | Blank line separated | `<p>...</p>` |
+| Inline Code | `` `code` `` | `<code>code</code>` |
 
 ## API Reference
 
@@ -107,6 +118,26 @@ result = md.render("<script>alert('xss')</script>")
 # Output: <p>&lt;script&gt;alert(&#x27;xss&#x27;)&lt;/script&gt;</p>
 ```
 
+### Code Block & Blockquote Security
+
+Content inside code blocks and blockquotes is also escaped in safe mode:
+
+```python
+md = Markdown(mode="safe")
+
+# Code blocks escape HTML
+result = md.render("```\n<script>bad()</script>\n```")
+# Output: <pre><code>&lt;script&gt;bad()&lt;/script&gt;</code></pre>
+
+# Inline code escapes HTML
+result = md.render("`<img onerror=alert(1)>`")
+# Output: <p><code>&lt;img onerror=alert(1)&gt;</code></p>
+
+# Blockquotes escape HTML
+result = md.render("> <script>alert(1)</script>")
+# Output: <blockquote><p>&lt;script&gt;alert(1)&lt;/script&gt;</p></blockquote>
+```
+
 ### Dangerous Pattern Detection
 
 The library detects and can reject:
@@ -152,6 +183,10 @@ FSTMD uses a **Mealy Machine** (FST) where output is generated during state tran
 │   │ close bold  │────────► output </strong>                    │
 │   └─────────────┘                                              │
 │                                                                 │
+│   ┌───────┐    '`'     ┌───────────┐    '`'   ┌───────┐        │
+│   │ TEXT  │───────────►│ IN_CODE   │─────────►│ TEXT  │        │
+│   └───────┘            └───────────┘          └───────┘        │
+│                                                                 │
 └─────────────────────────────────────────────────────────────────┘
 ```
 
@@ -175,6 +210,14 @@ FSTMD uses a **Mealy Machine** (FST) where output is generated during state tran
 │        ├─────────►│ LIST_ITEM     │──► emit <li>             │   │
 │        │          └───────────────┘                          │   │
 │        │                                                      │   │
+│        │   '>'    ┌───────────────┐                          │   │
+│        ├─────────►│ BLOCKQUOTE    │──► emit <blockquote>     │   │
+│        │          └───────────────┘                          │   │
+│        │                                                      │   │
+│        │   '```'  ┌───────────────┐                          │   │
+│        ├─────────►│ CODE_BLOCK    │──► emit <pre><code>      │   │
+│        │          └───────────────┘                          │   │
+│        │                                                      │   │
 │        │   '\n'   ┌───────────────┐                          │   │
 │        ├─────────►│ BLANK_LINE    │──► close paragraph       │   │
 │        │          └───────────────┘                          │   │
@@ -188,7 +231,7 @@ FSTMD uses a **Mealy Machine** (FST) where output is generated during state tran
 
 ### Key Design Decisions
 
-1. **Two-Character Lookahead Maximum** - Disambiguates `*` vs `**` vs `***`
+1. **Three-Character Lookahead Maximum** - Disambiguates `*` vs `**` vs `***` and detects ` ``` `
 2. **No Backtracking** - All decisions are final
 3. **Output During Transitions** - Mealy machine produces output as it processes
 4. **Immutable State Definitions** - States are enums, transitions are cached
@@ -228,13 +271,12 @@ print_benchmark_results(results)
 
 FSTMD focuses on speed and simplicity. It does **not** support:
 
-- Code blocks (fenced or indented)
-- Block quotes
 - Ordered lists
 - Links and images
 - Tables
 - Footnotes
 - HTML pass-through in safe mode
+- Language-specific syntax highlighting for code blocks
 
 For full CommonMark compliance, use [markdown-it-py](https://github.com/executablebooks/markdown-it-py).
 
@@ -268,22 +310,25 @@ fstmd/
 ├── __main__.py          # CLI entry point
 ├── parser.py            # High-level Markdown class
 ├── exceptions.py        # Custom exceptions
+├── py.typed             # PEP 561 marker for type checking
 ├── core/
 │   ├── __init__.py
 │   ├── fsm.py          # Main FST engine
-│   ├── states.py       # State definitions
+│   ├── states.py       # State definitions (inline + block)
 │   ├── transitions.py  # Transition table
 │   └── safe_html.py    # HTML escaping
 ├── benchmarks/
 │   ├── __init__.py
 │   └── runner.py       # Benchmark utilities
 └── tests/
-    ├── conftest.py
-    ├── test_inline.py
-    ├── test_blocks.py
-    ├── test_security.py
-    ├── test_fsm.py
-    └── test_integration.py
+    ├── conftest.py      # Pytest fixtures
+    ├── test_inline.py   # Inline formatting tests
+    ├── test_blocks.py   # Block-level tests
+    ├── test_code.py     # Inline code & code block tests
+    ├── test_blockquotes.py  # Blockquote tests
+    ├── test_security.py # XSS prevention tests
+    ├── test_fsm.py      # FST engine tests
+    └── test_integration.py  # Integration tests
 ```
 
 ## Building and Publishing

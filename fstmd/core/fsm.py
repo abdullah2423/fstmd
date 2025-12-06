@@ -27,6 +27,8 @@ from fstmd.core.states import (
     CHAR_DASH,
     CHAR_SPACE,
     CHAR_NEWLINE,
+    CHAR_BACKTICK,
+    CHAR_GT,
     MAX_HEADING_LEVEL,
 )
 from fstmd.core.safe_html import HTMLEscaper, escape_html
@@ -78,6 +80,18 @@ class FSTContext:
     
     # Column number (for error reporting)
     column: int
+    
+    # Blockquote depth (for nested blockquotes)
+    blockquote_depth: int
+    
+    # Whether we're in a code block
+    in_code_block: bool
+    
+    # Buffer for code block content
+    code_block_buffer: list[str]
+    
+    # Pending backticks count for code block detection
+    pending_backticks: int
 
 
 # HTML output constants
@@ -93,6 +107,12 @@ HTML_STRONG_OPEN: Final[str] = "<strong>"
 HTML_STRONG_CLOSE: Final[str] = "</strong>"
 HTML_BR: Final[str] = "<br>"
 HTML_NEWLINE: Final[str] = "\n"
+HTML_CODE_OPEN: Final[str] = "<code>"
+HTML_CODE_CLOSE: Final[str] = "</code>"
+HTML_PRE_OPEN: Final[str] = "<pre>"
+HTML_PRE_CLOSE: Final[str] = "</pre>"
+HTML_BLOCKQUOTE_OPEN: Final[str] = "<blockquote>"
+HTML_BLOCKQUOTE_CLOSE: Final[str] = "</blockquote>"
 
 # Heading tags lookup table
 HEADING_OPEN: Final[tuple[str, ...]] = (
@@ -161,6 +181,10 @@ class FST:
             position=0,
             line=1,
             column=1,
+            blockquote_depth=0,
+            in_code_block=False,
+            code_block_buffer=[],
+            pending_backticks=0,
         )
     
     def process(self, text: str) -> str:
@@ -250,6 +274,27 @@ class FST:
             case BlockState.BLANK_LINE:
                 self._process_blank_line(ctx, char, text, pos, length)
             
+            case BlockState.CODE_BLOCK_TICK_ONE:
+                self._process_code_block_tick_one(ctx, char)
+            
+            case BlockState.CODE_BLOCK_TICK_TWO:
+                self._process_code_block_tick_two(ctx, char)
+            
+            case BlockState.CODE_BLOCK_CONTENT:
+                self._process_code_block_content(ctx, char)
+            
+            case BlockState.CODE_BLOCK_CLOSE_ONE:
+                self._process_code_block_close_one(ctx, char)
+            
+            case BlockState.CODE_BLOCK_CLOSE_TWO:
+                self._process_code_block_close_two(ctx, char)
+            
+            case BlockState.BLOCKQUOTE_START:
+                self._process_blockquote_start(ctx, char, text, pos, length)
+            
+            case BlockState.BLOCKQUOTE_CONTENT:
+                self._process_blockquote_content(ctx, char, text, pos, length)
+            
             case _:
                 # Default: treat as paragraph content
                 self._process_paragraph(ctx, char)
@@ -276,6 +321,16 @@ class FST:
                     # Not a list, start paragraph
                     self._start_paragraph(ctx)
                     self._process_inline_char(ctx, char)
+            
+            case "`":
+                # Potential code block start
+                ctx.block_state = BlockState.CODE_BLOCK_TICK_ONE
+                ctx.pending_backticks = 1
+            
+            case ">":
+                # Blockquote start
+                self._start_blockquote(ctx)
+                ctx.block_state = BlockState.BLOCKQUOTE_START
             
             case "\n":
                 # Blank line
@@ -403,13 +458,27 @@ class FST:
         """Process potential blank line."""
         match char:
             case "\n":
-                # Confirmed blank line - close paragraph
+                # Confirmed blank line - close paragraph and blockquotes
                 self._close_current_block(ctx)
+                self._close_all_blockquotes(ctx)
                 ctx.block_state = BlockState.LINE_START
             
             case " " | "\t":
                 # Still might be blank line
                 pass
+            
+            case ">":
+                # Blockquote continuation
+                if ctx.in_paragraph:
+                    # Close current paragraph first
+                    self._flush_inline(ctx)
+                    ctx.output.append(HTML_P_CLOSE)
+                    ctx.output.append(HTML_NEWLINE)
+                    ctx.in_paragraph = False
+                if ctx.blockquote_depth == 0:
+                    # Start new blockquote
+                    self._start_blockquote(ctx)
+                ctx.block_state = BlockState.BLOCKQUOTE_START
             
             case _:
                 # Not a blank line - this is continuation
@@ -450,7 +519,7 @@ class FST:
         """
         Process a character through the inline FST.
         
-        Handles bold (**)  and italic (*) formatting.
+        Handles bold (**), italic (*), and inline code (`) formatting.
         Uses lookahead state for * vs ** disambiguation.
         """
         match ctx.inline_state:
@@ -490,6 +559,9 @@ class FST:
             case State.BOLD_ITALIC_STAR_THREE:
                 self._inline_bold_italic_star_three(ctx, char)
             
+            case State.IN_CODE:
+                self._inline_in_code(ctx, char)
+            
             case _:
                 # Default: output character
                 ctx.inline_buffer.append(self._escape_fn(char))
@@ -499,6 +571,10 @@ class FST:
         if char == CHAR_STAR:
             ctx.inline_state = State.STAR_ONE
             ctx.pending_stars = 1
+        elif char == CHAR_BACKTICK:
+            # Start inline code
+            ctx.inline_buffer.append(HTML_CODE_OPEN)
+            ctx.inline_state = State.IN_CODE
         else:
             ctx.inline_buffer.append(self._escape_fn(char))
     
@@ -608,6 +684,183 @@ class FST:
         ctx.inline_buffer.append(self._escape_fn(char))
         ctx.inline_state = State.TEXT
     
+    def _inline_in_code(self, ctx: FSTContext, char: str) -> None:
+        """Process character while in inline code."""
+        if char == CHAR_BACKTICK:
+            # Close inline code
+            ctx.inline_buffer.append(HTML_CODE_CLOSE)
+            ctx.inline_state = State.TEXT
+        else:
+            # In code, we still escape for XSS safety but no Markdown formatting
+            ctx.inline_buffer.append(self._escape_fn(char))
+    
+    # =========================================================================
+    # Code Block Methods (```)
+    # =========================================================================
+    
+    def _process_code_block_tick_one(self, ctx: FSTContext, char: str) -> None:
+        """Process after seeing first ` at line start."""
+        if char == CHAR_BACKTICK:
+            ctx.pending_backticks = 2
+            ctx.block_state = BlockState.CODE_BLOCK_TICK_TWO
+        else:
+            # Not a code block, just a single backtick at line start - start paragraph
+            self._start_paragraph(ctx)
+            ctx.inline_buffer.append(HTML_CODE_OPEN)
+            ctx.inline_state = State.IN_CODE
+            ctx.inline_buffer.append(self._escape_fn(char))
+            ctx.block_state = BlockState.PARAGRAPH
+            ctx.pending_backticks = 0
+    
+    def _process_code_block_tick_two(self, ctx: FSTContext, char: str) -> None:
+        """Process after seeing `` at line start."""
+        if char == CHAR_BACKTICK:
+            # We have ```, start code block
+            self._close_current_block(ctx)
+            ctx.in_code_block = True
+            ctx.output.append(HTML_PRE_OPEN)
+            ctx.output.append(HTML_CODE_OPEN)
+            ctx.block_state = BlockState.CODE_BLOCK_CONTENT
+            ctx.pending_backticks = 0
+        elif char == CHAR_NEWLINE:
+            # `` followed by newline - treat as literal text
+            self._start_paragraph(ctx)
+            ctx.inline_buffer.append(CHAR_BACKTICK)
+            ctx.inline_buffer.append(CHAR_BACKTICK)
+            ctx.block_state = BlockState.LINE_START
+            ctx.pending_backticks = 0
+        else:
+            # `` followed by other char - treat as literal text
+            self._start_paragraph(ctx)
+            ctx.inline_buffer.append(CHAR_BACKTICK)
+            ctx.inline_buffer.append(CHAR_BACKTICK)
+            ctx.inline_buffer.append(self._escape_fn(char))
+            ctx.block_state = BlockState.PARAGRAPH
+            ctx.pending_backticks = 0
+    
+    def _process_code_block_content(self, ctx: FSTContext, char: str) -> None:
+        """Process content inside a code block."""
+        if char == CHAR_BACKTICK:
+            ctx.block_state = BlockState.CODE_BLOCK_CLOSE_ONE
+        elif char == CHAR_NEWLINE:
+            ctx.code_block_buffer.append(char)
+        else:
+            # Escape for XSS but preserve content otherwise
+            ctx.code_block_buffer.append(self._escape_fn(char))
+    
+    def _process_code_block_close_one(self, ctx: FSTContext, char: str) -> None:
+        """Process after seeing first ` in code block (potential close)."""
+        if char == CHAR_BACKTICK:
+            ctx.block_state = BlockState.CODE_BLOCK_CLOSE_TWO
+        else:
+            # Single backtick in code - just content
+            ctx.code_block_buffer.append(CHAR_BACKTICK)
+            ctx.code_block_buffer.append(self._escape_fn(char))
+            ctx.block_state = BlockState.CODE_BLOCK_CONTENT
+    
+    def _process_code_block_close_two(self, ctx: FSTContext, char: str) -> None:
+        """Process after seeing `` in code block (potential close)."""
+        if char == CHAR_BACKTICK:
+            # ``` closes the code block
+            self._close_code_block(ctx)
+            ctx.block_state = BlockState.LINE_START
+        elif char == CHAR_NEWLINE:
+            # `` followed by newline - not close, just content
+            ctx.code_block_buffer.append(CHAR_BACKTICK)
+            ctx.code_block_buffer.append(CHAR_BACKTICK)
+            ctx.code_block_buffer.append(char)
+            ctx.block_state = BlockState.CODE_BLOCK_CONTENT
+        else:
+            # `` followed by other char - just content
+            ctx.code_block_buffer.append(CHAR_BACKTICK)
+            ctx.code_block_buffer.append(CHAR_BACKTICK)
+            ctx.code_block_buffer.append(self._escape_fn(char))
+            ctx.block_state = BlockState.CODE_BLOCK_CONTENT
+    
+    def _close_code_block(self, ctx: FSTContext) -> None:
+        """Close the current code block."""
+        if ctx.code_block_buffer:
+            content = "".join(ctx.code_block_buffer)
+            # Strip leading newline if present
+            if content.startswith("\n"):
+                content = content[1:]
+            # Strip trailing newline if present
+            if content.endswith("\n"):
+                content = content[:-1]
+            ctx.output.append(content)
+            ctx.code_block_buffer.clear()
+        ctx.output.append(HTML_CODE_CLOSE)
+        ctx.output.append(HTML_PRE_CLOSE)
+        ctx.output.append(HTML_NEWLINE)
+        ctx.in_code_block = False
+    
+    # =========================================================================
+    # Blockquote Methods (>)
+    # =========================================================================
+    
+    def _start_blockquote(self, ctx: FSTContext) -> None:
+        """Start a new blockquote or add nesting level."""
+        self._close_current_block(ctx)
+        ctx.blockquote_depth += 1
+        ctx.output.append(HTML_BLOCKQUOTE_OPEN)
+    
+    def _process_blockquote_start(
+        self,
+        ctx: FSTContext,
+        char: str,
+        text: str,
+        pos: int,
+        length: int
+    ) -> None:
+        """Process character after seeing > at line start."""
+        if char == CHAR_SPACE:
+            # > followed by space - start blockquote content
+            ctx.block_state = BlockState.BLOCKQUOTE_CONTENT
+        elif char == CHAR_GT:
+            # Nested blockquote
+            ctx.blockquote_depth += 1
+            ctx.output.append(HTML_BLOCKQUOTE_OPEN)
+            # Stay in BLOCKQUOTE_START to check for more nesting
+        elif char == CHAR_NEWLINE:
+            # Empty blockquote line
+            ctx.block_state = BlockState.LINE_START
+        else:
+            # > followed by content directly (no space)
+            ctx.block_state = BlockState.BLOCKQUOTE_CONTENT
+            self._start_paragraph(ctx)
+            self._process_inline_char(ctx, char)
+    
+    def _process_blockquote_content(
+        self,
+        ctx: FSTContext,
+        char: str,
+        text: str,
+        pos: int,
+        length: int
+    ) -> None:
+        """Process content inside a blockquote."""
+        if char == CHAR_NEWLINE:
+            # End of line in blockquote
+            self._flush_inline(ctx)
+            if ctx.in_paragraph:
+                ctx.output.append(HTML_P_CLOSE)
+                ctx.output.append(HTML_NEWLINE)
+                ctx.in_paragraph = False
+            ctx.block_state = BlockState.BLANK_LINE
+        else:
+            # Start paragraph if not started
+            if not ctx.in_paragraph:
+                ctx.output.append(HTML_P_OPEN)
+                ctx.in_paragraph = True
+            self._process_inline_char(ctx, char)
+    
+    def _close_all_blockquotes(self, ctx: FSTContext) -> None:
+        """Close all open blockquotes."""
+        while ctx.blockquote_depth > 0:
+            ctx.output.append(HTML_BLOCKQUOTE_CLOSE)
+            ctx.output.append(HTML_NEWLINE)
+            ctx.blockquote_depth -= 1
+    
     def _flush_inline(self, ctx: FSTContext) -> None:
         """Flush the inline buffer to output, closing any open tags."""
         # Handle any pending stars
@@ -632,6 +885,10 @@ class FST:
             
             case State.STAR_TWO:
                 ctx.inline_buffer.append(CHAR_STAR * 2)
+            
+            case State.IN_CODE:
+                # Close unclosed inline code
+                ctx.inline_buffer.append(HTML_CODE_CLOSE)
         
         # Output the buffer
         if ctx.inline_buffer:
@@ -642,6 +899,28 @@ class FST:
     
     def _finalize(self, ctx: FSTContext) -> None:
         """Finalize output after processing all input."""
+        # Handle code block that was never closed
+        if ctx.in_code_block:
+            self._close_code_block(ctx)
+        
+        # Handle pending code block start (incomplete ```)
+        if ctx.block_state == BlockState.CODE_BLOCK_TICK_ONE:
+            # Single backtick at line start, output as text
+            self._start_paragraph(ctx)
+            ctx.inline_buffer.append(CHAR_BACKTICK)
+        elif ctx.block_state == BlockState.CODE_BLOCK_TICK_TWO:
+            # Double backtick at line start, output as text
+            self._start_paragraph(ctx)
+            ctx.inline_buffer.append(CHAR_BACKTICK * 2)
+        elif ctx.block_state == BlockState.CODE_BLOCK_CLOSE_ONE:
+            # Single backtick at potential close
+            ctx.code_block_buffer.append(CHAR_BACKTICK)
+            self._close_code_block(ctx)
+        elif ctx.block_state == BlockState.CODE_BLOCK_CLOSE_TWO:
+            # Double backtick at potential close
+            ctx.code_block_buffer.append(CHAR_BACKTICK * 2)
+            self._close_code_block(ctx)
+        
         # Flush any remaining inline content
         self._flush_inline(ctx)
         
@@ -668,3 +947,6 @@ class FST:
             ctx.output.append(HTML_NEWLINE)
         
         self._close_list(ctx)
+        
+        # Close any open blockquotes
+        self._close_all_blockquotes(ctx)

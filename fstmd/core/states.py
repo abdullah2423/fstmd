@@ -50,6 +50,10 @@ class State(IntEnum):
     │   │ BOLD_STAR1 │────────►│ BOLD_CLOSE  │─► output </strong>    │
     │   └────────────┘         └─────────────┘                       │
     │                                                                 │
+    │   ┌───────┐    '`'     ┌───────────┐    '`'   ┌───────┐        │
+    │   │ TEXT  │───────────►│ IN_CODE   │─────────►│ TEXT  │        │
+    │   └───────┘            └───────────┘          └───────┘        │
+    │                                                                 │
     └─────────────────────────────────────────────────────────────────┘
     """
     
@@ -74,6 +78,9 @@ class State(IntEnum):
     BOLD_ITALIC_STAR_ONE: int = auto()
     BOLD_ITALIC_STAR_TWO: int = auto()
     BOLD_ITALIC_STAR_THREE: int = auto()
+    
+    # Inline code states (`code`)
+    IN_CODE: int = auto()
 
 
 class BlockState(IntEnum):
@@ -97,6 +104,14 @@ class BlockState(IntEnum):
     │        │                                                      │   │
     │        │   '-'    ┌───────────────┐                          │   │
     │        ├─────────►│ LIST_ITEM     │──► emit <li>             │   │
+    │        │          └───────────────┘                          │   │
+    │        │                                                      │   │
+    │        │   '>'    ┌───────────────┐                          │   │
+    │        ├─────────►│ BLOCKQUOTE    │──► emit <blockquote>     │   │
+    │        │          └───────────────┘                          │   │
+    │        │                                                      │   │
+    │        │   '```'  ┌───────────────┐                          │   │
+    │        ├─────────►│ CODE_BLOCK    │──► emit <pre><code>      │   │
     │        │          └───────────────┘                          │   │
     │        │                                                      │   │
     │        │   '\n'   ┌───────────────┐                          │   │
@@ -135,6 +150,17 @@ class BlockState(IntEnum):
     
     # End of document
     END: int = auto()
+    
+    # Code block states (```)
+    CODE_BLOCK_TICK_ONE: int = auto()
+    CODE_BLOCK_TICK_TWO: int = auto()
+    CODE_BLOCK_CONTENT: int = auto()
+    CODE_BLOCK_CLOSE_ONE: int = auto()
+    CODE_BLOCK_CLOSE_TWO: int = auto()
+    
+    # Blockquote states (>)
+    BLOCKQUOTE_START: int = auto()
+    BLOCKQUOTE_CONTENT: int = auto()
 
 
 # Character constants for fast comparison
@@ -149,9 +175,10 @@ CHAR_GT: Final[str] = ">"
 CHAR_AMP: Final[str] = "&"
 CHAR_QUOT: Final[str] = '"'
 CHAR_APOS: Final[str] = "'"
+CHAR_BACKTICK: Final[str] = "`"
 
 # Maximum lookahead buffer size
-MAX_LOOKAHEAD: Final[int] = 2
+MAX_LOOKAHEAD: Final[int] = 3
 
 # Maximum heading level
 MAX_HEADING_LEVEL: Final[int] = 6
