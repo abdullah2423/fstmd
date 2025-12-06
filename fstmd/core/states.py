@@ -100,6 +100,10 @@ class State(IntEnum):
     IMAGE_ALT_CLOSE: int = auto()     # Seen ]
     IMAGE_URL_OPEN: int = auto()      # Seen (
     IMAGE_URL: int = auto()           # Collecting URL
+    
+    # Footnote reference states [^label]
+    FOOTNOTE_REF_CARET: int = auto()  # Seen [^
+    FOOTNOTE_REF_LABEL: int = auto()  # Collecting label
 
 
 class BlockState(IntEnum):
@@ -191,6 +195,11 @@ class BlockState(IntEnum):
     TABLE_ROW: int = auto()              # Processing table row content
     TABLE_SEPARATOR: int = auto()        # Processing separator row (---, :---:)
     TABLE_CELL: int = auto()             # Processing cell content
+    
+    # Footnote definition states
+    FOOTNOTE_DEF_START: int = auto()     # Seen [^ at line start
+    FOOTNOTE_DEF_LABEL: int = auto()     # Collecting definition label
+    FOOTNOTE_DEF_CONTENT: int = auto()   # Collecting footnote content
 
 
 # Character constants for fast comparison
@@ -214,6 +223,7 @@ CHAR_BANG: Final[str] = "!"
 CHAR_PIPE: Final[str] = "|"
 CHAR_COLON: Final[str] = ":"
 CHAR_DOT: Final[str] = "."
+CHAR_CARET: Final[str] = "^"
 
 # Maximum lookahead buffer size
 MAX_LOOKAHEAD: Final[int] = 3

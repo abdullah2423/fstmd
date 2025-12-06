@@ -58,6 +58,7 @@ print(html)
 | Nested Blockquotes | `>> nested` | Nested `<blockquote>` elements |
 | Fenced Code Blocks | ` ``` ` | `<pre><code>...</code></pre>` |
 | Tables | `\| col \| col \|` | `<table>...</table>` |
+| Footnotes | `[^label]` and `[^label]:` | `<section class="footnotes">` |
 
 ### Inline Elements
 
@@ -69,6 +70,7 @@ print(html)
 | Inline Code | `` `code` `` | `<code>code</code>` |
 | Links | `[text](url)` | `<a href="url">text</a>` |
 | Images | `![alt](url)` | `<img src="url" alt="alt"/>` |
+| Footnote Refs | `[^label]` | `<sup><a href="#fn-label">N</a></sup>` |
 
 ### Links & Images
 
@@ -166,6 +168,50 @@ md.render("- [x] Parent task\n  - [ ] Child task")
 
 Task lists work with both `-` and `*` list markers.
 
+### Footnotes
+
+FSTMD supports GitHub-style footnotes with references and definitions:
+
+```python
+md = Markdown(mode="safe")
+
+# Basic footnote
+text = """This sentence has a footnote.[^1]
+
+[^1]: This is the footnote content."""
+md.render(text)
+# Output includes:
+# - Reference: <sup id="fnref-1"><a href="#fn-1">1</a></sup>
+# - Footnotes section at document end with the definition
+
+# Named footnotes
+text = """See the docs[^docs] for details.
+
+[^docs]: Documentation available at example.com."""
+md.render(text)
+
+# Multiple references to same footnote
+text = """First ref[^note] and second ref[^note].
+
+[^note]: Shared footnote content."""
+md.render(text)
+# Both references show the same number and link to the same definition
+
+# Inline formatting in footnotes
+text = """Text with footnote[^1].
+
+[^1]: Contains **bold**, *italic*, and `code` formatting."""
+md.render(text)
+# Footnote content supports full inline formatting
+```
+
+**Footnote behavior:**
+- Footnotes are numbered by order of first reference (not definition order)
+- Multiple references to the same footnote share the same number
+- Inline formatting works inside footnote content
+- Unreferenced definitions are not included in output
+- Labels can contain alphanumeric characters, underscores, and dashes
+
 ## API Reference
 
 ### Markdown Class
@@ -247,6 +293,24 @@ The library detects and can reject:
 - `javascript:` URLs
 - `vbscript:` URLs
 - `data:` URLs (except safe image types)
+
+### Footnote Security
+
+Footnote content is subject to the same security measures as other content:
+
+```python
+md = Markdown(mode="safe")
+
+# HTML in footnotes is escaped
+text = "Text[^1].\n\n[^1]: Has <script>alert('xss')</script> tag."
+md.render(text)
+# Output: &lt;script&gt;alert(&#x27;xss&#x27;)&lt;/script&gt;
+
+# JavaScript URLs blocked in footnote links
+text = "Text[^1].\n\n[^1]: Bad [link](javascript:alert(1))."
+md.render(text)
+# The javascript: URL is sanitized
+```
 
 ### Link & Image URL Security
 
@@ -399,6 +463,7 @@ FSTMD uses a **Mealy Machine** (FST) where output is generated during state tran
 5. **DRY URL Handling** - Links and images share URL sanitization logic
 6. **Stack-Based Nesting** - Nested lists and blockquotes use explicit stacks for proper depth tracking
 7. **Table State Machine** - Tables use a dedicated sub-FST for header/separator/body row parsing
+8. **Footnote Collection** - Footnotes are collected during parsing and rendered as a section at document end
 
 ## Performance
 
@@ -437,7 +502,7 @@ FSTMD focuses on speed and simplicity. It does **not** support:
 
 - Reference-style links (`[text][ref]`)
 - Link titles (`[text](url "title")`)
-- Footnotes
+- Multi-paragraph footnotes (only single paragraph supported)
 - HTML pass-through in safe mode
 - Language-specific syntax highlighting for code blocks
 
@@ -494,6 +559,7 @@ fstmd/
     ├── test_tables.py   # Table parsing tests
     ├── test_nested_lists.py  # Nested list tests
     ├── test_task_lists.py   # Task list (checkbox) tests
+    ├── test_footnotes.py    # Footnote tests
     ├── test_security.py # XSS prevention tests
     ├── test_fsm.py      # FST engine tests
     └── test_integration.py  # Integration tests

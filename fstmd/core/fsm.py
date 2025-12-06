@@ -37,6 +37,7 @@ from fstmd.core.states import (
     CHAR_PIPE,
     CHAR_COLON,
     CHAR_DOT,
+    CHAR_CARET,
     MAX_HEADING_LEVEL,
 )
 from fstmd.core.safe_html import HTMLEscaper, escape_html, sanitize_url, is_safe_url
@@ -130,6 +131,13 @@ class FSTContext:
     
     # Task list state - number of characters to skip after checkbox detection
     task_list_skip_count: int
+    
+    # Footnote state
+    footnote_definitions: dict[str, list[str]]  # label -> list of content lines
+    footnote_order: list[str]                   # labels in order of first reference
+    footnote_pending_label: str                 # label being parsed for definition
+    footnote_label_buffer: list[str]            # buffer for collecting label
+    footnote_content_buffer: list[str]          # buffer for current footnote content
 
 
 # HTML output constants
@@ -183,6 +191,15 @@ HTML_TH_ALIGN_RIGHT: Final[str] = '<th style="text-align:right">'
 HTML_TD_ALIGN_LEFT: Final[str] = '<td style="text-align:left">'
 HTML_TD_ALIGN_CENTER: Final[str] = '<td style="text-align:center">'
 HTML_TD_ALIGN_RIGHT: Final[str] = '<td style="text-align:right">'
+
+# Footnote HTML constants
+HTML_FOOTNOTE_SECTION_OPEN: Final[str] = '<section class="footnotes">'
+HTML_FOOTNOTE_SECTION_CLOSE: Final[str] = '</section>'
+HTML_SUP_OPEN: Final[str] = '<sup id="fnref-'
+HTML_SUP_MIDDLE: Final[str] = '"><a href="#fn-'
+HTML_SUP_END: Final[str] = '</a></sup>'
+HTML_FOOTNOTE_LI_OPEN: Final[str] = '<li id="fn-'
+HTML_FOOTNOTE_LI_OPEN_END: Final[str] = '">'
 
 # Heading tags lookup table
 HEADING_OPEN: Final[tuple[str, ...]] = (
@@ -273,6 +290,12 @@ class FST:
             table_has_body=False,
             # Task list state
             task_list_skip_count=0,
+            # Footnote state
+            footnote_definitions={},
+            footnote_order=[],
+            footnote_pending_label="",
+            footnote_label_buffer=[],
+            footnote_content_buffer=[],
         )
     
     def process(self, text: str) -> str:
@@ -412,6 +435,16 @@ class FST:
             case BlockState.TABLE_CELL:
                 self._process_table_cell(ctx, char, text, pos, length)
             
+            # Footnote definition states
+            case BlockState.FOOTNOTE_DEF_START:
+                self._process_footnote_def_start(ctx, char)
+            
+            case BlockState.FOOTNOTE_DEF_LABEL:
+                self._process_footnote_def_label(ctx, char)
+            
+            case BlockState.FOOTNOTE_DEF_CONTENT:
+                self._process_footnote_def_content(ctx, char, text, pos, length)
+            
             case _:
                 # Default: treat as paragraph content
                 self._process_paragraph(ctx, char)
@@ -450,6 +483,17 @@ class FST:
             case "|":
                 # Potential table row
                 self._start_table_row(ctx, text, pos, length)
+            
+            case "[":
+                # Potential footnote definition [^label]:
+                if pos + 1 < length and text[pos + 1] == "^":
+                    # Could be footnote definition
+                    ctx.footnote_label_buffer.clear()
+                    ctx.block_state = BlockState.FOOTNOTE_DEF_START
+                else:
+                    # Regular bracket - start paragraph
+                    self._start_paragraph(ctx)
+                    self._process_inline_char(ctx, char)
             
             case "`":
                 # Potential code block start
@@ -757,6 +801,13 @@ class FST:
             case State.IMAGE_URL:
                 self._inline_image_url(ctx, char)
             
+            # Footnote reference states
+            case State.FOOTNOTE_REF_CARET:
+                self._inline_footnote_ref_caret(ctx, char)
+            
+            case State.FOOTNOTE_REF_LABEL:
+                self._inline_footnote_ref_label(ctx, char)
+            
             case _:
                 # Default: output character
                 ctx.inline_buffer.append(self._escape_fn(char))
@@ -905,8 +956,12 @@ class FST:
     # =========================================================================
     
     def _inline_link_open(self, ctx: FSTContext, char: str) -> None:
-        """Process character after seeing [ (potential link start)."""
-        if char == CHAR_RBRACKET:
+        """Process character after seeing [ (potential link start or footnote ref)."""
+        if char == "^":
+            # Potential footnote reference [^
+            ctx.inline_state = State.FOOTNOTE_REF_CARET
+            ctx.footnote_label_buffer.clear()
+        elif char == CHAR_RBRACKET:
             # Empty link text [] - not a valid link, output literally
             ctx.inline_buffer.append(CHAR_LBRACKET)
             ctx.inline_buffer.append(CHAR_RBRACKET)
@@ -1275,6 +1330,73 @@ class FST:
         ctx.link_text_buffer.clear()
         ctx.link_url_buffer.clear()
         ctx.inline_state = State.TEXT
+    
+    # =========================================================================
+    # Footnote Reference Methods [^label]
+    # =========================================================================
+    
+    def _inline_footnote_ref_caret(self, ctx: FSTContext, char: str) -> None:
+        """Process character after [^ (potential footnote reference)."""
+        if self._is_valid_footnote_label_char(char):
+            # Start collecting footnote label
+            ctx.footnote_label_buffer.append(char)
+            ctx.inline_state = State.FOOTNOTE_REF_LABEL
+        else:
+            # Not a valid footnote reference - output [^ literally
+            ctx.inline_buffer.append(CHAR_LBRACKET)
+            ctx.inline_buffer.append("^")
+            ctx.inline_state = State.TEXT
+            self._inline_text(ctx, char)
+    
+    def _inline_footnote_ref_label(self, ctx: FSTContext, char: str) -> None:
+        """Process character while collecting footnote reference label."""
+        if char == CHAR_RBRACKET:
+            # End of footnote reference
+            label = "".join(ctx.footnote_label_buffer)
+            if label:
+                self._emit_footnote_reference(ctx, label)
+            else:
+                # Empty label [^] - output literally
+                ctx.inline_buffer.append(CHAR_LBRACKET)
+                ctx.inline_buffer.append("^")
+                ctx.inline_buffer.append(CHAR_RBRACKET)
+            ctx.footnote_label_buffer.clear()
+            ctx.inline_state = State.TEXT
+        elif self._is_valid_footnote_label_char(char):
+            ctx.footnote_label_buffer.append(char)
+        else:
+            # Invalid char in label - output [^... literally
+            ctx.inline_buffer.append(CHAR_LBRACKET)
+            ctx.inline_buffer.append("^")
+            ctx.inline_buffer.extend(ctx.footnote_label_buffer)
+            ctx.footnote_label_buffer.clear()
+            ctx.inline_state = State.TEXT
+            self._inline_text(ctx, char)
+    
+    def _is_valid_footnote_label_char(self, char: str) -> bool:
+        """Check if character is valid in a footnote label (alphanumeric, underscore, dash)."""
+        return char.isalnum() or char == "_" or char == "-"
+    
+    def _emit_footnote_reference(self, ctx: FSTContext, label: str) -> None:
+        """Emit HTML for a footnote reference and track the label order."""
+        # Get or assign footnote number based on first reference order
+        if label not in ctx.footnote_order:
+            ctx.footnote_order.append(label)
+        
+        # Get the 1-based index
+        index = ctx.footnote_order.index(label) + 1
+        
+        # Escape the label for use in HTML attributes
+        escaped_label = self._escape_fn(label)
+        
+        # Emit: <sup id="fnref-N"><a href="#fn-N">N</a></sup>
+        ctx.inline_buffer.append(HTML_SUP_OPEN)
+        ctx.inline_buffer.append(escaped_label)
+        ctx.inline_buffer.append(HTML_SUP_MIDDLE)
+        ctx.inline_buffer.append(escaped_label)
+        ctx.inline_buffer.append('">') 
+        ctx.inline_buffer.append(str(index))
+        ctx.inline_buffer.append(HTML_SUP_END)
     
     # =========================================================================
     # Code Block Methods (```)
@@ -1993,6 +2115,133 @@ class FST:
             ctx.table_alignments.clear()
             ctx.table_has_body = False
 
+    # =========================================================================
+    # Footnote Definition Methods [^label]:
+    # =========================================================================
+    
+    def _process_footnote_def_start(self, ctx: FSTContext, char: str) -> None:
+        """Process after seeing [ at line start (checking for ^ next)."""
+        if char == "^":
+            # Confirmed [^ at line start - now collect the label
+            ctx.block_state = BlockState.FOOTNOTE_DEF_LABEL
+        else:
+            # Not a footnote definition - treat as paragraph with [
+            self._start_paragraph(ctx)
+            ctx.inline_buffer.append(CHAR_LBRACKET)
+            self._process_inline_char(ctx, char)
+    
+    def _process_footnote_def_label(self, ctx: FSTContext, char: str) -> None:
+        """Process while collecting footnote definition label."""
+        if char == CHAR_RBRACKET:
+            # Need to check for : next
+            # Store the label and wait for colon
+            ctx.footnote_pending_label = "".join(ctx.footnote_label_buffer)
+            ctx.footnote_label_buffer.clear()
+            # Stay in this state and check next char for colon
+        elif char == CHAR_COLON and ctx.footnote_pending_label:
+            # Valid footnote definition start [^label]:
+            # Close any current block and start footnote definition
+            self._close_current_block(ctx)
+            ctx.footnote_content_buffer.clear()
+            ctx.block_state = BlockState.FOOTNOTE_DEF_CONTENT
+        elif self._is_valid_footnote_label_char(char):
+            if ctx.footnote_pending_label:
+                # We saw ] but not : immediately after, so treat as paragraph
+                self._abort_footnote_def(ctx, char)
+            else:
+                ctx.footnote_label_buffer.append(char)
+        elif char == CHAR_NEWLINE:
+            # Newline before completing definition - treat as paragraph
+            self._abort_footnote_def_newline(ctx)
+        else:
+            # Invalid char - treat as paragraph
+            self._abort_footnote_def(ctx, char)
+    
+    def _process_footnote_def_content(
+        self,
+        ctx: FSTContext,
+        char: str,
+        text: str,
+        pos: int,
+        length: int
+    ) -> None:
+        """Process content of a footnote definition."""
+        if char == CHAR_NEWLINE:
+            # End of line - check if next line is a continuation
+            # A continuation line starts with 2+ spaces or a tab
+            if pos + 1 < length:
+                next_char = text[pos + 1]
+                if next_char in (CHAR_SPACE, "\t"):
+                    # Potential continuation - add newline to buffer and wait
+                    ctx.footnote_content_buffer.append(char)
+                else:
+                    # Not a continuation - finish this footnote definition
+                    self._finish_footnote_definition(ctx)
+                    ctx.block_state = BlockState.LINE_START
+            else:
+                # End of input - finish this footnote definition
+                self._finish_footnote_definition(ctx)
+                ctx.block_state = BlockState.LINE_START
+        elif char in (CHAR_SPACE, "\t") and not ctx.footnote_content_buffer:
+            # Skip leading whitespace after the colon
+            pass
+        elif char in (CHAR_SPACE, "\t"):
+            # Check if this is a continuation line (after newline)
+            content_str = "".join(ctx.footnote_content_buffer)
+            if content_str.endswith("\n"):
+                # Skip the leading indent on continuation line
+                pass
+            else:
+                ctx.footnote_content_buffer.append(char)
+        else:
+            ctx.footnote_content_buffer.append(char)
+    
+    def _finish_footnote_definition(self, ctx: FSTContext) -> None:
+        """Finish the current footnote definition and store it."""
+        if ctx.footnote_pending_label:
+            content = "".join(ctx.footnote_content_buffer).strip()
+            if content:
+                # Store the definition - use a list to support multiple lines
+                if ctx.footnote_pending_label not in ctx.footnote_definitions:
+                    ctx.footnote_definitions[ctx.footnote_pending_label] = []
+                ctx.footnote_definitions[ctx.footnote_pending_label].append(content)
+            ctx.footnote_pending_label = ""
+            ctx.footnote_content_buffer.clear()
+    
+    def _abort_footnote_def(self, ctx: FSTContext, char: str) -> None:
+        """Abort footnote definition parsing and treat as paragraph."""
+        self._start_paragraph(ctx)
+        ctx.inline_buffer.append(CHAR_LBRACKET)
+        ctx.inline_buffer.append("^")
+        if ctx.footnote_pending_label:
+            ctx.inline_buffer.append(self._escape_fn(ctx.footnote_pending_label))
+            ctx.inline_buffer.append(CHAR_RBRACKET)
+            ctx.footnote_pending_label = ""
+        else:
+            for c in ctx.footnote_label_buffer:
+                ctx.inline_buffer.append(self._escape_fn(c))
+        ctx.footnote_label_buffer.clear()
+        self._process_inline_char(ctx, char)
+    
+    def _abort_footnote_def_newline(self, ctx: FSTContext) -> None:
+        """Abort footnote definition at newline and output as paragraph."""
+        self._start_paragraph(ctx)
+        ctx.inline_buffer.append(CHAR_LBRACKET)
+        ctx.inline_buffer.append("^")
+        if ctx.footnote_pending_label:
+            ctx.inline_buffer.append(self._escape_fn(ctx.footnote_pending_label))
+            ctx.inline_buffer.append(CHAR_RBRACKET)
+            ctx.footnote_pending_label = ""
+        else:
+            for c in ctx.footnote_label_buffer:
+                ctx.inline_buffer.append(self._escape_fn(c))
+        ctx.footnote_label_buffer.clear()
+        self._flush_inline(ctx)
+        ctx.output.append(HTML_P_CLOSE)
+        ctx.output.append(HTML_NEWLINE)
+        ctx.in_paragraph = False
+        ctx.block_state = BlockState.LINE_START
+
     def _close_all_blockquotes(self, ctx: FSTContext) -> None:
         """Close all open blockquotes."""
         while ctx.blockquote_depth > 0:
@@ -2077,11 +2326,22 @@ class FST:
                 ctx.inline_buffer.append(CHAR_RBRACKET)
                 ctx.inline_buffer.append(CHAR_LPAREN)
                 ctx.inline_buffer.extend([self._escape_fn(c) for c in ctx.link_url_buffer])
+            
+            # Footnote reference states - abort and output literally
+            case State.FOOTNOTE_REF_CARET:
+                ctx.inline_buffer.append(CHAR_LBRACKET)
+                ctx.inline_buffer.append("^")
+            
+            case State.FOOTNOTE_REF_LABEL:
+                ctx.inline_buffer.append(CHAR_LBRACKET)
+                ctx.inline_buffer.append("^")
+                ctx.inline_buffer.extend([self._escape_fn(c) for c in ctx.footnote_label_buffer])
         
         # Clear link/image buffers
         ctx.link_text_buffer.clear()
         ctx.link_url_buffer.clear()
         ctx.link_text_formatting.clear()
+        ctx.footnote_label_buffer.clear()
         
         # Output the buffer
         if ctx.inline_buffer:
@@ -2118,6 +2378,10 @@ class FST:
         # (will be closed by _close_all_nested_lists)
         if ctx.block_state == BlockState.NESTED_LIST_CONTENT:
             self._flush_inline(ctx)
+        
+        # Handle pending footnote definition content
+        if ctx.block_state == BlockState.FOOTNOTE_DEF_CONTENT:
+            self._finish_footnote_definition(ctx)
         
         # Flush any remaining inline content
         self._flush_inline(ctx)
@@ -2172,3 +2436,57 @@ class FST:
         
         # Close any open blockquotes
         self._close_all_blockquotes(ctx)
+        
+        # Emit footnotes section if there are any referenced footnotes
+        self._emit_footnotes_section(ctx)
+    
+    def _emit_footnotes_section(self, ctx: FSTContext) -> None:
+        """Emit the <section class="footnotes"> block with all referenced footnotes."""
+        if not ctx.footnote_order:
+            return
+        
+        # Only include footnotes that are both referenced and defined
+        has_any_footnotes = False
+        for label in ctx.footnote_order:
+            if label in ctx.footnote_definitions:
+                has_any_footnotes = True
+                break
+        
+        if not has_any_footnotes:
+            return
+        
+        ctx.output.append(HTML_NEWLINE)
+        ctx.output.append(HTML_FOOTNOTE_SECTION_OPEN)
+        ctx.output.append(HTML_NEWLINE)
+        ctx.output.append(HTML_OL_OPEN)
+        ctx.output.append(HTML_NEWLINE)
+        
+        for label in ctx.footnote_order:
+            if label not in ctx.footnote_definitions:
+                # Skip footnotes that are referenced but not defined
+                continue
+            
+            escaped_label = self._escape_fn(label)
+            
+            # Output: <li id="fn-label">
+            ctx.output.append(HTML_FOOTNOTE_LI_OPEN)
+            ctx.output.append(escaped_label)
+            ctx.output.append(HTML_FOOTNOTE_LI_OPEN_END)
+            ctx.output.append(HTML_NEWLINE)
+            
+            # Output the footnote content as paragraphs
+            content_lines = ctx.footnote_definitions[label]
+            for content in content_lines:
+                ctx.output.append(HTML_P_OPEN)
+                # Process inline content for formatting
+                rendered_content = self._process_inline_content(ctx, content)
+                ctx.output.append(rendered_content)
+                ctx.output.append(HTML_P_CLOSE)
+                ctx.output.append(HTML_NEWLINE)
+            
+            ctx.output.append(HTML_LI_CLOSE)
+            ctx.output.append(HTML_NEWLINE)
+        
+        ctx.output.append(HTML_OL_CLOSE)
+        ctx.output.append(HTML_NEWLINE)
+        ctx.output.append(HTML_FOOTNOTE_SECTION_CLOSE)
