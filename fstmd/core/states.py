@@ -180,6 +180,17 @@ class BlockState(IntEnum):
     # Blockquote states (>)
     BLOCKQUOTE_START: int = auto()
     BLOCKQUOTE_CONTENT: int = auto()
+    
+    # Nested list states - supports -, *, and numbered lists with indentation
+    NESTED_LIST_INDENT: int = auto()     # Counting indentation at line start
+    NESTED_LIST_MARKER: int = auto()     # Seen list marker (-, *, digit)
+    NESTED_LIST_NUMBER: int = auto()     # Collecting number for ordered list
+    NESTED_LIST_CONTENT: int = auto()    # List item content
+    
+    # Table states (GFM subset)
+    TABLE_ROW: int = auto()              # Processing table row content
+    TABLE_SEPARATOR: int = auto()        # Processing separator row (---, :---:)
+    TABLE_CELL: int = auto()             # Processing cell content
 
 
 # Character constants for fast comparison
@@ -200,6 +211,9 @@ CHAR_RBRACKET: Final[str] = "]"
 CHAR_LPAREN: Final[str] = "("
 CHAR_RPAREN: Final[str] = ")"
 CHAR_BANG: Final[str] = "!"
+CHAR_PIPE: Final[str] = "|"
+CHAR_COLON: Final[str] = ":"
+CHAR_DOT: Final[str] = "."
 
 # Maximum lookahead buffer size
 MAX_LOOKAHEAD: Final[int] = 3

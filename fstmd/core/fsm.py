@@ -34,6 +34,9 @@ from fstmd.core.states import (
     CHAR_LPAREN,
     CHAR_RPAREN,
     CHAR_BANG,
+    CHAR_PIPE,
+    CHAR_COLON,
+    CHAR_DOT,
     MAX_HEADING_LEVEL,
 )
 from fstmd.core.safe_html import HTMLEscaper, escape_html, sanitize_url, is_safe_url
@@ -103,6 +106,27 @@ class FSTContext:
     link_url_buffer: list[str]     # Buffer for (url) portion
     link_text_state: State         # Inline state within link text (for nested formatting)
     link_text_formatting: list[str]  # Stack of open formatting in link text
+    
+    # Nested list state - stack of (list_type, indent_level)
+    # list_type: "ul" for unordered, "ol" for ordered
+    list_stack: list[tuple[str, int]]
+    
+    # Current indentation level being parsed
+    current_indent: int
+    
+    # Pending list marker character (-, *, or digit)
+    pending_list_marker: str
+    
+    # Pending number for ordered lists
+    pending_list_number: str
+    
+    # Table state
+    in_table: bool
+    table_header_row: list[str]          # Raw header cells
+    table_alignments: list[str]          # "left", "center", "right", or ""
+    table_row_buffer: list[str]          # Current row cells
+    table_cell_buffer: list[str]         # Current cell content
+    table_has_body: bool                 # Whether we've seen body rows
 
 
 # HTML output constants
@@ -110,6 +134,8 @@ HTML_P_OPEN: Final[str] = "<p>"
 HTML_P_CLOSE: Final[str] = "</p>"
 HTML_UL_OPEN: Final[str] = "<ul>"
 HTML_UL_CLOSE: Final[str] = "</ul>"
+HTML_OL_OPEN: Final[str] = "<ol>"
+HTML_OL_CLOSE: Final[str] = "</ol>"
 HTML_LI_OPEN: Final[str] = "<li>"
 HTML_LI_CLOSE: Final[str] = "</li>"
 HTML_EM_OPEN: Final[str] = "<em>"
@@ -130,6 +156,26 @@ HTML_A_CLOSE: Final[str] = "</a>"
 HTML_IMG_START: Final[str] = '<img src="'
 HTML_IMG_ALT: Final[str] = '" alt="'
 HTML_IMG_END: Final[str] = '"/>'
+
+# Table HTML constants
+HTML_TABLE_OPEN: Final[str] = "<table>"
+HTML_TABLE_CLOSE: Final[str] = "</table>"
+HTML_THEAD_OPEN: Final[str] = "<thead>"
+HTML_THEAD_CLOSE: Final[str] = "</thead>"
+HTML_TBODY_OPEN: Final[str] = "<tbody>"
+HTML_TBODY_CLOSE: Final[str] = "</tbody>"
+HTML_TR_OPEN: Final[str] = "<tr>"
+HTML_TR_CLOSE: Final[str] = "</tr>"
+HTML_TH_OPEN: Final[str] = "<th>"
+HTML_TH_CLOSE: Final[str] = "</th>"
+HTML_TD_OPEN: Final[str] = "<td>"
+HTML_TD_CLOSE: Final[str] = "</td>"
+HTML_TH_ALIGN_LEFT: Final[str] = '<th style="text-align:left">'
+HTML_TH_ALIGN_CENTER: Final[str] = '<th style="text-align:center">'
+HTML_TH_ALIGN_RIGHT: Final[str] = '<th style="text-align:right">'
+HTML_TD_ALIGN_LEFT: Final[str] = '<td style="text-align:left">'
+HTML_TD_ALIGN_CENTER: Final[str] = '<td style="text-align:center">'
+HTML_TD_ALIGN_RIGHT: Final[str] = '<td style="text-align:right">'
 
 # Heading tags lookup table
 HEADING_OPEN: Final[tuple[str, ...]] = (
@@ -206,6 +252,18 @@ class FST:
             link_url_buffer=[],
             link_text_state=State.TEXT,
             link_text_formatting=[],
+            # Nested list state
+            list_stack=[],
+            current_indent=0,
+            pending_list_marker="",
+            pending_list_number="",
+            # Table state
+            in_table=False,
+            table_header_row=[],
+            table_alignments=[],
+            table_row_buffer=[],
+            table_cell_buffer=[],
+            table_has_body=False,
         )
     
     def process(self, text: str) -> str:
@@ -316,6 +374,29 @@ class FST:
             case BlockState.BLOCKQUOTE_CONTENT:
                 self._process_blockquote_content(ctx, char, text, pos, length)
             
+            # Nested list states
+            case BlockState.NESTED_LIST_INDENT:
+                self._process_nested_list_indent(ctx, char, text, pos, length)
+            
+            case BlockState.NESTED_LIST_MARKER:
+                self._process_nested_list_marker(ctx, char, text, pos, length)
+            
+            case BlockState.NESTED_LIST_NUMBER:
+                self._process_nested_list_number(ctx, char, text, pos, length)
+            
+            case BlockState.NESTED_LIST_CONTENT:
+                self._process_nested_list_content(ctx, char, text, pos, length)
+            
+            # Table states
+            case BlockState.TABLE_ROW:
+                self._process_table_row(ctx, char, text, pos, length)
+            
+            case BlockState.TABLE_SEPARATOR:
+                self._process_table_separator(ctx, char, text, pos, length)
+            
+            case BlockState.TABLE_CELL:
+                self._process_table_cell(ctx, char, text, pos, length)
+            
             case _:
                 # Default: treat as paragraph content
                 self._process_paragraph(ctx, char)
@@ -334,14 +415,26 @@ class FST:
                 ctx.block_state = BlockState.HEADING_HASHES
                 ctx.heading_level = 1
             
-            case "-":
-                # Check if followed by space (list item)
+            case "-" | "*":
+                # Check if followed by space (list item) or if it's a table separator
                 if pos + 1 < length and text[pos + 1] == CHAR_SPACE:
-                    ctx.block_state = BlockState.LIST_MARKER
+                    # Unordered list item at indent 0
+                    ctx.current_indent = 0
+                    ctx.pending_list_marker = char
+                    ctx.block_state = BlockState.NESTED_LIST_MARKER
+                elif char == "-" and self._is_table_separator_line(text, pos, length):
+                    # This might be a table separator - but only if we're in a table context
+                    # At line start, this would be invalid, so treat as paragraph
+                    self._start_paragraph(ctx)
+                    self._process_inline_char(ctx, char)
                 else:
                     # Not a list, start paragraph
                     self._start_paragraph(ctx)
                     self._process_inline_char(ctx, char)
+            
+            case "|":
+                # Potential table row
+                self._start_table_row(ctx, text, pos, length)
             
             case "`":
                 # Potential code block start
@@ -359,8 +452,20 @@ class FST:
                 self._close_current_block(ctx)
             
             case " " | "\t":
-                # Skip leading whitespace at line start
-                pass
+                # Indentation - could be nested list or continuation
+                if ctx.list_stack:
+                    # We're in a list context - check for nested list
+                    ctx.current_indent = 1 if char == CHAR_SPACE else 4
+                    ctx.block_state = BlockState.NESTED_LIST_INDENT
+                else:
+                    # Skip leading whitespace at line start (not in list)
+                    pass
+            
+            case _ if char.isdigit():
+                # Potential ordered list (1. 2. etc.)
+                ctx.current_indent = 0
+                ctx.pending_list_number = char
+                ctx.block_state = BlockState.NESTED_LIST_NUMBER
             
             case _:
                 # Regular content - start or continue paragraph
@@ -515,6 +620,8 @@ class FST:
         """Start a new paragraph if not already in one."""
         if not ctx.in_paragraph:
             self._close_list(ctx)
+            self._close_all_nested_lists(ctx)
+            self._close_table(ctx)
             ctx.output.append(HTML_P_OPEN)
             ctx.in_paragraph = True
             ctx.block_state = BlockState.PARAGRAPH
@@ -529,6 +636,8 @@ class FST:
             ctx.in_paragraph = False
         
         self._close_list(ctx)
+        self._close_all_nested_lists(ctx)
+        self._close_table(ctx)
         ctx.inline_state = State.TEXT
     
     def _close_list(self, ctx: FSTContext) -> None:
@@ -1312,6 +1421,550 @@ class FST:
                 ctx.in_paragraph = True
             self._process_inline_char(ctx, char)
     
+    # =========================================================================
+    # Nested List Methods (-, *, 1.)
+    # =========================================================================
+    
+    def _process_nested_list_indent(
+        self,
+        ctx: FSTContext,
+        char: str,
+        text: str,
+        pos: int,
+        length: int
+    ) -> None:
+        """Process indentation at line start (potential nested list)."""
+        if char == CHAR_SPACE:
+            ctx.current_indent += 1
+        elif char == "\t":
+            ctx.current_indent += 4  # Tab = 4 spaces
+        elif char in ("-", "*"):
+            # Check if followed by space (nested list item)
+            if pos + 1 < length and text[pos + 1] == CHAR_SPACE:
+                ctx.pending_list_marker = char
+                ctx.block_state = BlockState.NESTED_LIST_MARKER
+            else:
+                # Not a list item - handle as content
+                self._handle_indented_content(ctx, char)
+        elif char.isdigit():
+            # Potential ordered list
+            ctx.pending_list_number = char
+            ctx.block_state = BlockState.NESTED_LIST_NUMBER
+        elif char == CHAR_NEWLINE:
+            # Empty indented line - close nested lists as needed
+            self._close_nested_lists_to_indent(ctx, 0)
+            ctx.block_state = BlockState.LINE_START
+        else:
+            # Non-list content at this indent
+            self._handle_indented_content(ctx, char)
+    
+    def _process_nested_list_marker(
+        self,
+        ctx: FSTContext,
+        char: str,
+        text: str,
+        pos: int,
+        length: int
+    ) -> None:
+        """Process after seeing list marker (- or *)."""
+        if char == CHAR_SPACE:
+            # Valid list item marker
+            self._start_nested_list_item(ctx, "ul")
+            ctx.block_state = BlockState.NESTED_LIST_CONTENT
+        else:
+            # Not a valid list marker - treat as paragraph
+            self._abort_list_marker(ctx, char)
+    
+    def _process_nested_list_number(
+        self,
+        ctx: FSTContext,
+        char: str,
+        text: str,
+        pos: int,
+        length: int
+    ) -> None:
+        """Process while collecting ordered list number."""
+        if char.isdigit():
+            ctx.pending_list_number += char
+        elif char == CHAR_DOT:
+            # Check if followed by space
+            if pos + 1 < length and text[pos + 1] == CHAR_SPACE:
+                ctx.block_state = BlockState.NESTED_LIST_MARKER
+                ctx.pending_list_marker = "1"  # Mark as ordered list
+            else:
+                # Not a valid list - treat as paragraph
+                self._abort_list_number(ctx, char)
+        else:
+            # Not a valid ordered list - treat as paragraph
+            self._abort_list_number(ctx, char)
+    
+    def _process_nested_list_content(
+        self,
+        ctx: FSTContext,
+        char: str,
+        text: str,
+        pos: int,
+        length: int
+    ) -> None:
+        """Process content inside a list item."""
+        if char == CHAR_NEWLINE:
+            # End of list item content - don't close <li> yet, might have nested content
+            self._flush_inline(ctx)
+            ctx.block_state = BlockState.LINE_START
+            ctx.inline_state = State.TEXT
+        else:
+            self._process_inline_char(ctx, char)
+    
+    def _start_nested_list_item(self, ctx: FSTContext, list_type: str) -> None:
+        """Start a new nested list item at the current indentation level."""
+        # Close paragraph if open
+        if ctx.in_paragraph:
+            self._flush_inline(ctx)
+            ctx.output.append(HTML_P_CLOSE)
+            ctx.output.append(HTML_NEWLINE)
+            ctx.in_paragraph = False
+        
+        # Determine target indent level (2 spaces per level)
+        target_level = ctx.current_indent // 2
+        
+        # If ordered list marker, override list_type
+        if ctx.pending_list_marker == "1":
+            list_type = "ol"
+        
+        # Get current depth (number of open lists)
+        current_depth = len(ctx.list_stack)
+        
+        if current_depth == 0:
+            # No list open yet - open the first one
+            self._open_nested_list(ctx, list_type, target_level)
+        elif target_level > ctx.list_stack[-1][1]:
+            # Going deeper - open nested list (inside current li)
+            self._open_nested_list(ctx, list_type, target_level)
+        elif target_level < ctx.list_stack[-1][1]:
+            # Going shallower - close nested lists
+            while ctx.list_stack and ctx.list_stack[-1][1] > target_level:
+                ctx.output.append(HTML_LI_CLOSE)
+                ctx.output.append(HTML_NEWLINE)
+                self._close_nested_list(ctx)
+            # Close the previous item at this level if we have one
+            if ctx.list_stack:
+                ctx.output.append(HTML_LI_CLOSE)
+                ctx.output.append(HTML_NEWLINE)
+        else:
+            # Same level - close previous item
+            ctx.output.append(HTML_LI_CLOSE)
+            ctx.output.append(HTML_NEWLINE)
+            # Check if list type changed
+            if ctx.list_stack and ctx.list_stack[-1][0] != list_type:
+                self._close_nested_list(ctx)
+                self._open_nested_list(ctx, list_type, target_level)
+        
+        # Output list item
+        ctx.output.append(HTML_LI_OPEN)
+        # Note: Don't set ctx.in_list here - that's for the old list system
+        
+        # Clear pending markers
+        ctx.pending_list_marker = ""
+        ctx.pending_list_number = ""
+        ctx.current_indent = 0
+    
+    def _open_nested_list(self, ctx: FSTContext, list_type: str, level: int) -> None:
+        """Open a new nested list."""
+        if list_type == "ol":
+            ctx.output.append(HTML_OL_OPEN)
+        else:
+            ctx.output.append(HTML_UL_OPEN)
+        ctx.output.append(HTML_NEWLINE)
+        ctx.list_stack.append((list_type, level))
+    
+    def _close_nested_list(self, ctx: FSTContext) -> None:
+        """Close the innermost nested list."""
+        if ctx.list_stack:
+            list_type, _ = ctx.list_stack.pop()
+            if list_type == "ol":
+                ctx.output.append(HTML_OL_CLOSE)
+            else:
+                ctx.output.append(HTML_UL_CLOSE)
+            ctx.output.append(HTML_NEWLINE)
+        if not ctx.list_stack:
+            ctx.in_list = False
+    
+    def _close_nested_lists_to_indent(self, ctx: FSTContext, target_level: int) -> None:
+        """Close all nested lists down to the target indentation level."""
+        while ctx.list_stack and len(ctx.list_stack) > target_level:
+            # Close the current item
+            ctx.output.append(HTML_LI_CLOSE)
+            ctx.output.append(HTML_NEWLINE)
+            self._close_nested_list(ctx)
+    
+    def _close_all_nested_lists(self, ctx: FSTContext) -> None:
+        """Close all open nested lists."""
+        while ctx.list_stack:
+            ctx.output.append(HTML_LI_CLOSE)
+            ctx.output.append(HTML_NEWLINE)
+            self._close_nested_list(ctx)
+    
+    def _handle_indented_content(self, ctx: FSTContext, char: str) -> None:
+        """Handle non-list content that appeared after indentation."""
+        # This is either continuation content or a new paragraph
+        if ctx.list_stack:
+            # In a list context - this could be continued list item
+            # For simplicity, treat as new paragraph outside list
+            self._close_all_nested_lists(ctx)
+        self._start_paragraph(ctx)
+        self._process_inline_char(ctx, char)
+        ctx.current_indent = 0
+    
+    def _abort_list_marker(self, ctx: FSTContext, char: str) -> None:
+        """Abort list marker parsing and treat as paragraph."""
+        self._start_paragraph(ctx)
+        # Output the indent as spaces
+        for _ in range(ctx.current_indent):
+            ctx.inline_buffer.append(CHAR_SPACE)
+        # Output the marker character
+        ctx.inline_buffer.append(self._escape_fn(ctx.pending_list_marker))
+        # Process current char
+        self._process_inline_char(ctx, char)
+        ctx.pending_list_marker = ""
+        ctx.current_indent = 0
+    
+    def _abort_list_number(self, ctx: FSTContext, char: str) -> None:
+        """Abort ordered list number parsing and treat as paragraph."""
+        self._start_paragraph(ctx)
+        # Output the indent as spaces
+        for _ in range(ctx.current_indent):
+            ctx.inline_buffer.append(CHAR_SPACE)
+        # Output the number
+        ctx.inline_buffer.append(self._escape_fn(ctx.pending_list_number))
+        # Process current char
+        self._process_inline_char(ctx, char)
+        ctx.pending_list_number = ""
+        ctx.current_indent = 0
+    
+    # =========================================================================
+    # Table Methods (GFM subset)
+    # =========================================================================
+    
+    def _is_table_separator_line(self, text: str, pos: int, length: int) -> bool:
+        """Check if from current position we have a table separator line."""
+        # A separator line contains only |, -, :, and spaces
+        i = pos
+        has_dash = False
+        while i < length:
+            c = text[i]
+            if c == CHAR_NEWLINE:
+                break
+            if c == CHAR_DASH:
+                has_dash = True
+            elif c not in (CHAR_PIPE, CHAR_COLON, CHAR_SPACE, CHAR_DASH):
+                return False
+            i += 1
+        return has_dash
+    
+    def _start_table_row(
+        self,
+        ctx: FSTContext,
+        text: str,
+        pos: int,
+        length: int
+    ) -> None:
+        """Start processing a potential table row."""
+        # Don't close things if we're already in a table
+        if not ctx.in_table:
+            if ctx.in_paragraph:
+                self._flush_inline(ctx)
+                ctx.output.append(HTML_P_CLOSE)
+                ctx.output.append(HTML_NEWLINE)
+                ctx.in_paragraph = False
+            
+            self._close_all_nested_lists(ctx)
+        
+        # Start collecting row
+        ctx.table_row_buffer.clear()
+        ctx.table_cell_buffer.clear()
+        ctx.block_state = BlockState.TABLE_ROW
+    
+    def _process_table_row(
+        self,
+        ctx: FSTContext,
+        char: str,
+        text: str,
+        pos: int,
+        length: int
+    ) -> None:
+        """Process characters in a table row."""
+        if char == CHAR_PIPE:
+            # End of cell, start new one
+            cell = "".join(ctx.table_cell_buffer).strip()
+            ctx.table_row_buffer.append(cell)
+            ctx.table_cell_buffer.clear()
+        elif char == CHAR_NEWLINE:
+            # End of row
+            cell = "".join(ctx.table_cell_buffer).strip()
+            if cell:  # Don't add empty trailing cell
+                ctx.table_row_buffer.append(cell)
+            ctx.table_cell_buffer.clear()
+            self._finish_table_row(ctx, text, pos, length)
+        else:
+            ctx.table_cell_buffer.append(char)
+    
+    def _finish_table_row(
+        self,
+        ctx: FSTContext,
+        text: str,
+        pos: int,
+        length: int
+    ) -> None:
+        """Finish processing a table row and determine next action."""
+        row = ctx.table_row_buffer[:]  # Copy the row
+        
+        # Remove leading empty cell if row started with |
+        if row and row[0] == "":
+            row = row[1:]
+        
+        # Remove trailing empty cell if row ended with |
+        if row and row[-1] == "":
+            row = row[:-1]
+        
+        if not ctx.in_table:
+            # This is potentially a header row
+            # Check if next line is separator
+            next_line_start = pos + 1
+            if next_line_start < length and self._is_separator_row(text, next_line_start, length):
+                # This is a header row - store it
+                ctx.table_header_row = row
+                ctx.in_table = True
+                ctx.table_has_body = False
+                ctx.block_state = BlockState.LINE_START
+            else:
+                # Not a table - output as paragraph
+                self._output_row_as_paragraph(ctx, row)
+                ctx.block_state = BlockState.LINE_START
+        elif not ctx.table_alignments:
+            # We have a header but no alignments yet - this should be separator
+            if self._parse_separator_row(ctx, row):
+                # Valid separator - output table header
+                self._output_table_header(ctx)
+                ctx.block_state = BlockState.LINE_START
+            else:
+                # Invalid separator - abort table
+                self._abort_table(ctx, row)
+        else:
+            # This is a body row
+            self._output_table_body_row(ctx, row)
+            ctx.block_state = BlockState.LINE_START
+        
+        ctx.table_row_buffer.clear()
+    
+    def _is_separator_row(self, text: str, pos: int, length: int) -> bool:
+        """Check if the line starting at pos is a valid table separator."""
+        i = pos
+        has_dash = False
+        pipe_count = 0
+        
+        while i < length:
+            c = text[i]
+            if c == CHAR_NEWLINE:
+                break
+            if c == CHAR_DASH:
+                has_dash = True
+            elif c == CHAR_PIPE:
+                pipe_count += 1
+            elif c not in (CHAR_COLON, CHAR_SPACE):
+                return False
+            i += 1
+        
+        return has_dash and pipe_count > 0
+    
+    def _parse_separator_row(self, ctx: FSTContext, row: list[str]) -> bool:
+        """Parse a separator row and extract alignments. Returns True if valid."""
+        alignments = []
+        
+        for cell in row:
+            cell = cell.strip()
+            if not cell:
+                alignments.append("")
+                continue
+            
+            # Check for alignment patterns
+            left_colon = cell.startswith(CHAR_COLON)
+            right_colon = cell.endswith(CHAR_COLON)
+            
+            # Remove colons for validation
+            inner = cell.strip(CHAR_COLON)
+            
+            # Must have at least one dash
+            if not inner or not all(c == CHAR_DASH for c in inner):
+                return False
+            
+            if left_colon and right_colon:
+                alignments.append("center")
+            elif right_colon:
+                alignments.append("right")
+            elif left_colon:
+                alignments.append("left")
+            else:
+                alignments.append("")
+        
+        ctx.table_alignments = alignments
+        return True
+    
+    def _output_table_header(self, ctx: FSTContext) -> None:
+        """Output the table header row."""
+        ctx.output.append(HTML_TABLE_OPEN)
+        ctx.output.append(HTML_NEWLINE)
+        ctx.output.append(HTML_THEAD_OPEN)
+        ctx.output.append(HTML_NEWLINE)
+        ctx.output.append(HTML_TR_OPEN)
+        
+        for i, cell in enumerate(ctx.table_header_row):
+            alignment = ctx.table_alignments[i] if i < len(ctx.table_alignments) else ""
+            self._output_table_cell(ctx, cell, is_header=True, alignment=alignment)
+        
+        ctx.output.append(HTML_TR_CLOSE)
+        ctx.output.append(HTML_NEWLINE)
+        ctx.output.append(HTML_THEAD_CLOSE)
+        ctx.output.append(HTML_NEWLINE)
+    
+    def _output_table_body_row(self, ctx: FSTContext, row: list[str]) -> None:
+        """Output a table body row."""
+        if not ctx.table_has_body:
+            ctx.output.append(HTML_TBODY_OPEN)
+            ctx.output.append(HTML_NEWLINE)
+            ctx.table_has_body = True
+        
+        ctx.output.append(HTML_TR_OPEN)
+        
+        for i, cell in enumerate(row):
+            alignment = ctx.table_alignments[i] if i < len(ctx.table_alignments) else ""
+            self._output_table_cell(ctx, cell, is_header=False, alignment=alignment)
+        
+        ctx.output.append(HTML_TR_CLOSE)
+        ctx.output.append(HTML_NEWLINE)
+    
+    def _output_table_cell(
+        self,
+        ctx: FSTContext,
+        content: str,
+        is_header: bool,
+        alignment: str
+    ) -> None:
+        """Output a single table cell with proper escaping."""
+        # Choose opening tag based on header/alignment
+        if is_header:
+            if alignment == "left":
+                ctx.output.append(HTML_TH_ALIGN_LEFT)
+            elif alignment == "center":
+                ctx.output.append(HTML_TH_ALIGN_CENTER)
+            elif alignment == "right":
+                ctx.output.append(HTML_TH_ALIGN_RIGHT)
+            else:
+                ctx.output.append(HTML_TH_OPEN)
+        else:
+            if alignment == "left":
+                ctx.output.append(HTML_TD_ALIGN_LEFT)
+            elif alignment == "center":
+                ctx.output.append(HTML_TD_ALIGN_CENTER)
+            elif alignment == "right":
+                ctx.output.append(HTML_TD_ALIGN_RIGHT)
+            else:
+                ctx.output.append(HTML_TD_OPEN)
+        
+        # Process cell content through inline parser for formatting
+        # Create a mini-context for cell content parsing
+        escaped_content = self._process_inline_content(ctx, content)
+        ctx.output.append(escaped_content)
+        
+        # Close tag
+        if is_header:
+            ctx.output.append(HTML_TH_CLOSE)
+        else:
+            ctx.output.append(HTML_TD_CLOSE)
+    
+    def _process_inline_content(self, ctx: FSTContext, content: str) -> str:
+        """Process inline content and return HTML string."""
+        # Save current inline state
+        saved_state = ctx.inline_state
+        saved_buffer = ctx.inline_buffer[:]
+        saved_pending = ctx.pending_stars
+        
+        # Reset for fresh inline processing
+        ctx.inline_state = State.TEXT
+        ctx.inline_buffer = []
+        ctx.pending_stars = 0
+        
+        # Process each character
+        for char in content:
+            self._process_inline_char(ctx, char)
+        
+        # Flush any pending inline state
+        if ctx.pending_stars > 0:
+            ctx.inline_buffer.append(CHAR_STAR * ctx.pending_stars)
+            ctx.pending_stars = 0
+        
+        # Close any open formatting
+        match ctx.inline_state:
+            case State.IN_ITALIC | State.ITALIC_STAR:
+                ctx.inline_buffer.append(HTML_EM_CLOSE)
+            case State.IN_BOLD | State.BOLD_STAR_ONE:
+                ctx.inline_buffer.append(HTML_STRONG_CLOSE)
+            case State.IN_BOLD_ITALIC | State.BOLD_ITALIC_STAR_ONE | State.BOLD_ITALIC_STAR_TWO:
+                ctx.inline_buffer.append(HTML_EM_CLOSE)
+                ctx.inline_buffer.append(HTML_STRONG_CLOSE)
+            case State.STAR_ONE:
+                ctx.inline_buffer.append(CHAR_STAR)
+            case State.STAR_TWO:
+                ctx.inline_buffer.append(CHAR_STAR * 2)
+            case State.IN_CODE:
+                ctx.inline_buffer.append(HTML_CODE_CLOSE)
+        
+        result = "".join(ctx.inline_buffer)
+        
+        # Restore state
+        ctx.inline_state = saved_state
+        ctx.inline_buffer = saved_buffer
+        ctx.pending_stars = saved_pending
+        
+        return result
+    
+    def _output_row_as_paragraph(self, ctx: FSTContext, row: list[str]) -> None:
+        """Output a row as paragraph content (not a table)."""
+        content = CHAR_PIPE + CHAR_PIPE.join(row) + CHAR_PIPE
+        self._start_paragraph(ctx)
+        for char in content:
+            self._process_inline_char(ctx, char)
+    
+    def _abort_table(self, ctx: FSTContext, row: list[str]) -> None:
+        """Abort table parsing and output accumulated content as paragraphs."""
+        # Output header row as paragraph
+        self._output_row_as_paragraph(ctx, ctx.table_header_row)
+        self._flush_inline(ctx)
+        ctx.output.append(HTML_P_CLOSE)
+        ctx.output.append(HTML_NEWLINE)
+        ctx.in_paragraph = False
+        
+        # Output current row as paragraph
+        self._output_row_as_paragraph(ctx, row)
+        
+        # Reset table state
+        ctx.in_table = False
+        ctx.table_header_row.clear()
+        ctx.table_alignments.clear()
+        ctx.table_has_body = False
+    
+    def _close_table(self, ctx: FSTContext) -> None:
+        """Close an open table."""
+        if ctx.in_table:
+            if ctx.table_has_body:
+                ctx.output.append(HTML_TBODY_CLOSE)
+                ctx.output.append(HTML_NEWLINE)
+            ctx.output.append(HTML_TABLE_CLOSE)
+            ctx.output.append(HTML_NEWLINE)
+            ctx.in_table = False
+            ctx.table_header_row.clear()
+            ctx.table_alignments.clear()
+            ctx.table_has_body = False
+
     def _close_all_blockquotes(self, ctx: FSTContext) -> None:
         """Close all open blockquotes."""
         while ctx.blockquote_depth > 0:
@@ -1433,6 +2086,11 @@ class FST:
             ctx.code_block_buffer.append(CHAR_BACKTICK * 2)
             self._close_code_block(ctx)
         
+        # Handle pending nested list content - flush but don't close li yet
+        # (will be closed by _close_all_nested_lists)
+        if ctx.block_state == BlockState.NESTED_LIST_CONTENT:
+            self._flush_inline(ctx)
+        
         # Flush any remaining inline content
         self._flush_inline(ctx)
         
@@ -1453,12 +2111,36 @@ class FST:
             ctx.output.append(HEADING_CLOSE[level])
             ctx.heading_level = 0
         
-        # Close any open list item (if we ended mid-list)
+        # Close any open list item (if we ended mid-list) - old list system
         if ctx.block_state == BlockState.LIST_CONTENT:
             ctx.output.append(HTML_LI_CLOSE)
             ctx.output.append(HTML_NEWLINE)
         
         self._close_list(ctx)
+        
+        # Close all nested lists (new nested list system)
+        self._close_all_nested_lists(ctx)
+        
+        # Finish any pending table row before closing table
+        if ctx.in_table and (ctx.table_row_buffer or ctx.table_cell_buffer):
+            # Flush any pending cell content
+            if ctx.table_cell_buffer:
+                ctx.table_row_buffer.append("".join(ctx.table_cell_buffer).strip())
+                ctx.table_cell_buffer.clear()
+            
+            # Get the row - no need to remove leading/trailing empty cells here
+            # because _start_table_row handles leading pipe and trailing pipes
+            # add actual empty cells only if there's content between them
+            row = ctx.table_row_buffer[:]
+            
+            # If we have alignments, this is a body row
+            if ctx.table_alignments and row:
+                self._output_table_body_row(ctx, row)
+            
+            ctx.table_row_buffer.clear()
+        
+        # Close any open table
+        self._close_table(ctx)
         
         # Close any open blockquotes
         self._close_all_blockquotes(ctx)

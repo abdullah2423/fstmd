@@ -50,10 +50,13 @@ print(html)
 |---------|--------|--------|
 | Paragraphs | Blank line separated | `<p>...</p>` |
 | Headings | `# H1` to `###### H6` | `<h1>` to `<h6>` |
-| Unordered Lists | `- item` | `<ul><li>item</li></ul>` |
+| Unordered Lists | `- item` or `* item` | `<ul><li>item</li></ul>` |
+| Ordered Lists | `1. item` | `<ol><li>item</li></ol>` |
+| Nested Lists | Indented `- item` | Nested `<ul>`/`<ol>` elements |
 | Blockquotes | `> quote` | `<blockquote>...</blockquote>` |
 | Nested Blockquotes | `>> nested` | Nested `<blockquote>` elements |
 | Fenced Code Blocks | ` ``` ` | `<pre><code>...</code></pre>` |
+| Tables | `\| col \| col \|` | `<table>...</table>` |
 
 ### Inline Elements
 
@@ -84,6 +87,56 @@ md.render("[**bold link**](https://example.com)")
 # Image
 md.render("![Logo](https://example.com/logo.png)")
 # Output: <p><img src="https://example.com/logo.png" alt="Logo"/></p>
+```
+
+### Nested Lists
+
+FSTMD supports nested lists with proper indentation (2 spaces per level):
+
+```python
+md = Markdown(mode="safe")
+
+# Nested unordered lists
+md.render("- Item 1\n  - Nested item\n  - Another nested\n- Item 2")
+# Output:
+# <ul>
+# <li>Item 1
+# <ul>
+# <li>Nested item</li>
+# <li>Another nested</li>
+# </ul>
+# </li>
+# <li>Item 2</li>
+# </ul>
+
+# Ordered lists
+md.render("1. First\n2. Second\n3. Third")
+# Output: <ol><li>First</li><li>Second</li><li>Third</li></ol>
+```
+
+### Tables
+
+FSTMD supports GFM-style tables with column alignment:
+
+```python
+md = Markdown(mode="safe")
+
+# Basic table
+table = """| Name | Age |
+|------|-----|
+| Alice | 30 |
+| Bob | 25 |"""
+md.render(table)
+# Output: <table><thead><tr><th>Name</th><th>Age</th></tr></thead>
+#         <tbody><tr><td>Alice</td><td>30</td></tr>
+#         <tr><td>Bob</td><td>25</td></tr></tbody></table>
+
+# Column alignment
+aligned = """| Left | Center | Right |
+|:-----|:------:|------:|
+| L | C | R |"""
+md.render(aligned)
+# Uses style="text-align:left|center|right" on cells
 ```
 
 ## API Reference
@@ -283,6 +336,14 @@ FSTMD uses a **Mealy Machine** (FST) where output is generated during state tran
 │        ├─────────►│ LIST_ITEM     │──► emit <li>             │   │
 │        │          └───────────────┘                          │   │
 │        │                                                      │   │
+│        │   '1.'   ┌───────────────┐                          │   │
+│        ├─────────►│ ORDERED_LIST  │──► emit <ol><li>         │   │
+│        │          └───────────────┘                          │   │
+│        │                                                      │   │
+│        │   '|'    ┌───────────────┐                          │   │
+│        ├─────────►│ TABLE_ROW     │──► emit <table>          │   │
+│        │          └───────────────┘                          │   │
+│        │                                                      │   │
 │        │   '>'    ┌───────────────┐                          │   │
 │        ├─────────►│ BLOCKQUOTE    │──► emit <blockquote>     │   │
 │        │          └───────────────┘                          │   │
@@ -309,6 +370,8 @@ FSTMD uses a **Mealy Machine** (FST) where output is generated during state tran
 3. **Output During Transitions** - Mealy machine produces output as it processes
 4. **Immutable State Definitions** - States are enums, transitions are cached
 5. **DRY URL Handling** - Links and images share URL sanitization logic
+6. **Stack-Based Nesting** - Nested lists and blockquotes use explicit stacks for proper depth tracking
+7. **Table State Machine** - Tables use a dedicated sub-FST for header/separator/body row parsing
 
 ## Performance
 
@@ -345,13 +408,12 @@ print_benchmark_results(results)
 
 FSTMD focuses on speed and simplicity. It does **not** support:
 
-- Ordered lists
 - Reference-style links (`[text][ref]`)
 - Link titles (`[text](url "title")`)
-- Tables
 - Footnotes
 - HTML pass-through in safe mode
 - Language-specific syntax highlighting for code blocks
+- Task lists (`- [ ] item`)
 
 For full CommonMark compliance, use [markdown-it-py](https://github.com/executablebooks/markdown-it-py).
 
@@ -401,8 +463,10 @@ fstmd/
     ├── test_blocks.py   # Block-level tests
     ├── test_code.py     # Inline code & code block tests
     ├── test_blockquotes.py  # Blockquote tests
-    ├── test_links.py    # Link formatting tests
-    ├── test_images.py   # Image formatting tests
+    ├── test_links.py    # Link formatting & URL security tests
+    ├── test_images.py   # Image formatting & URL security tests
+    ├── test_tables.py   # Table parsing tests
+    ├── test_nested_lists.py  # Nested list tests
     ├── test_security.py # XSS prevention tests
     ├── test_fsm.py      # FST engine tests
     └── test_integration.py  # Integration tests
