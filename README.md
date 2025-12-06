@@ -63,6 +63,28 @@ print(html)
 | Italic | `*text*` | `<em>text</em>` |
 | Bold+Italic | `***text***` | `<strong><em>text</em></strong>` |
 | Inline Code | `` `code` `` | `<code>code</code>` |
+| Links | `[text](url)` | `<a href="url">text</a>` |
+| Images | `![alt](url)` | `<img src="url" alt="alt"/>` |
+
+### Links & Images
+
+Links support formatted text inside the link text:
+
+```python
+md = Markdown(mode="safe")
+
+# Basic link
+md.render("[click here](https://example.com)")
+# Output: <p><a href="https://example.com">click here</a></p>
+
+# Bold text in link
+md.render("[**bold link**](https://example.com)")
+# Output: <p><a href="https://example.com"><strong>bold link</strong></a></p>
+
+# Image
+md.render("![Logo](https://example.com/logo.png)")
+# Output: <p><img src="https://example.com/logo.png" alt="Logo"/></p>
+```
 
 ## API Reference
 
@@ -146,6 +168,38 @@ The library detects and can reject:
 - `vbscript:` URLs
 - `data:` URLs (except safe image types)
 
+### Link & Image URL Security
+
+In safe mode, URLs in links and images are sanitized to prevent XSS attacks:
+
+**Blocked protocols:**
+- `javascript:` (case-insensitive)
+- `vbscript:`
+- `data:`
+
+**Allowed protocols:**
+- `http://`, `https://`
+- `mailto:`, `tel:`, `ftp://`
+- Anchor links (`#section`)
+- Relative paths (`/page`, `./file`)
+
+```python
+md = Markdown(mode="safe")
+
+# Safe URLs work normally
+md.render("[link](https://example.com)")
+# Output: <p><a href="https://example.com">link</a></p>
+
+# Dangerous URLs are rendered as plain text
+md.render("[click](javascript:alert(1))")
+# Output: <p>[click](javascript:alert(1))</p>
+
+# In raw mode (trusted input only), all URLs pass through
+md_raw = Markdown(mode="raw")
+md_raw.render("[click](javascript:void)")
+# Output: <p><a href="javascript:void">click</a></p>
+```
+
 ## Architecture
 
 ### Finite State Transducer Design
@@ -186,6 +240,25 @@ FSTMD uses a **Mealy Machine** (FST) where output is generated during state tran
 │   ┌───────┐    '`'     ┌───────────┐    '`'   ┌───────┐        │
 │   │ TEXT  │───────────►│ IN_CODE   │─────────►│ TEXT  │        │
 │   └───────┘            └───────────┘          └───────┘        │
+│                                                                 │
+│   ┌───────┐    '['     ┌───────────┐    ']'   ┌───────────┐    │
+│   │ TEXT  │───────────►│ LINK_TEXT │─────────►│ LINK_CLOSE│    │
+│   └───────┘            └───────────┘          └─────┬─────┘    │
+│                                                      │ '('      │
+│                                                      ▼          │
+│                                               ┌───────────┐     │
+│                                               │ LINK_URL  │     │
+│                                               └─────┬─────┘     │
+│                                                     │ ')'       │
+│                                                     ▼           │
+│                                               output <a href>   │
+│                                                                 │
+│   ┌───────┐   '!['    ┌───────────┐    ']'   ┌───────────┐     │
+│   │ TEXT  │──────────►│ IMAGE_ALT │─────────►│ IMAGE_URL │     │
+│   └───────┘           └───────────┘          └─────┬─────┘     │
+│                                                    │ ')'        │
+│                                                    ▼            │
+│                                              output <img>       │
 │                                                                 │
 └─────────────────────────────────────────────────────────────────┘
 ```
@@ -235,6 +308,7 @@ FSTMD uses a **Mealy Machine** (FST) where output is generated during state tran
 2. **No Backtracking** - All decisions are final
 3. **Output During Transitions** - Mealy machine produces output as it processes
 4. **Immutable State Definitions** - States are enums, transitions are cached
+5. **DRY URL Handling** - Links and images share URL sanitization logic
 
 ## Performance
 
@@ -272,7 +346,8 @@ print_benchmark_results(results)
 FSTMD focuses on speed and simplicity. It does **not** support:
 
 - Ordered lists
-- Links and images
+- Reference-style links (`[text][ref]`)
+- Link titles (`[text](url "title")`)
 - Tables
 - Footnotes
 - HTML pass-through in safe mode
@@ -326,6 +401,8 @@ fstmd/
     ├── test_blocks.py   # Block-level tests
     ├── test_code.py     # Inline code & code block tests
     ├── test_blockquotes.py  # Blockquote tests
+    ├── test_links.py    # Link formatting tests
+    ├── test_images.py   # Image formatting tests
     ├── test_security.py # XSS prevention tests
     ├── test_fsm.py      # FST engine tests
     └── test_integration.py  # Integration tests

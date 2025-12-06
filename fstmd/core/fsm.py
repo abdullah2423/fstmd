@@ -29,9 +29,14 @@ from fstmd.core.states import (
     CHAR_NEWLINE,
     CHAR_BACKTICK,
     CHAR_GT,
+    CHAR_LBRACKET,
+    CHAR_RBRACKET,
+    CHAR_LPAREN,
+    CHAR_RPAREN,
+    CHAR_BANG,
     MAX_HEADING_LEVEL,
 )
-from fstmd.core.safe_html import HTMLEscaper, escape_html
+from fstmd.core.safe_html import HTMLEscaper, escape_html, sanitize_url, is_safe_url
 
 
 class OutputMode(Enum):
@@ -92,6 +97,12 @@ class FSTContext:
     
     # Pending backticks count for code block detection
     pending_backticks: int
+    
+    # Link/Image parsing buffers (shared via helper logic)
+    link_text_buffer: list[str]    # Buffer for [text] portion
+    link_url_buffer: list[str]     # Buffer for (url) portion
+    link_text_state: State         # Inline state within link text (for nested formatting)
+    link_text_formatting: list[str]  # Stack of open formatting in link text
 
 
 # HTML output constants
@@ -113,6 +124,12 @@ HTML_PRE_OPEN: Final[str] = "<pre>"
 HTML_PRE_CLOSE: Final[str] = "</pre>"
 HTML_BLOCKQUOTE_OPEN: Final[str] = "<blockquote>"
 HTML_BLOCKQUOTE_CLOSE: Final[str] = "</blockquote>"
+HTML_A_OPEN_START: Final[str] = '<a href="'
+HTML_A_OPEN_END: Final[str] = '">'
+HTML_A_CLOSE: Final[str] = "</a>"
+HTML_IMG_START: Final[str] = '<img src="'
+HTML_IMG_ALT: Final[str] = '" alt="'
+HTML_IMG_END: Final[str] = '"/>'
 
 # Heading tags lookup table
 HEADING_OPEN: Final[tuple[str, ...]] = (
@@ -185,6 +202,10 @@ class FST:
             in_code_block=False,
             code_block_buffer=[],
             pending_backticks=0,
+            link_text_buffer=[],
+            link_url_buffer=[],
+            link_text_state=State.TEXT,
+            link_text_formatting=[],
         )
     
     def process(self, text: str) -> str:
@@ -442,6 +463,8 @@ class FST:
         match char:
             case "\n":
                 # Check for paragraph break (blank line coming)
+                # But first, flush any partial link/image state
+                self._flush_inline(ctx)
                 ctx.block_state = BlockState.BLANK_LINE
             
             case _:
@@ -519,7 +542,8 @@ class FST:
         """
         Process a character through the inline FST.
         
-        Handles bold (**), italic (*), and inline code (`) formatting.
+        Handles bold (**), italic (*), inline code (`), links [text](url),
+        and images ![alt](url) formatting.
         Uses lookahead state for * vs ** disambiguation.
         """
         match ctx.inline_state:
@@ -562,6 +586,53 @@ class FST:
             case State.IN_CODE:
                 self._inline_in_code(ctx, char)
             
+            # Link states
+            case State.LINK_OPEN:
+                self._inline_link_open(ctx, char)
+            
+            case State.LINK_TEXT:
+                self._inline_link_text(ctx, char)
+            
+            case State.LINK_TEXT_STAR_ONE:
+                self._inline_link_text_star_one(ctx, char)
+            
+            case State.LINK_TEXT_STAR_TWO:
+                self._inline_link_text_star_two(ctx, char)
+            
+            case State.LINK_TEXT_ITALIC:
+                self._inline_link_text_italic(ctx, char)
+            
+            case State.LINK_TEXT_BOLD:
+                self._inline_link_text_bold(ctx, char)
+            
+            case State.LINK_TEXT_CLOSE:
+                self._inline_link_text_close(ctx, char)
+            
+            case State.LINK_URL_OPEN:
+                self._inline_link_url_open(ctx, char)
+            
+            case State.LINK_URL:
+                self._inline_link_url(ctx, char)
+            
+            # Image states
+            case State.IMAGE_BANG:
+                self._inline_image_bang(ctx, char)
+            
+            case State.IMAGE_OPEN:
+                self._inline_image_open(ctx, char)
+            
+            case State.IMAGE_ALT:
+                self._inline_image_alt(ctx, char)
+            
+            case State.IMAGE_ALT_CLOSE:
+                self._inline_image_alt_close(ctx, char)
+            
+            case State.IMAGE_URL_OPEN:
+                self._inline_image_url_open(ctx, char)
+            
+            case State.IMAGE_URL:
+                self._inline_image_url(ctx, char)
+            
             case _:
                 # Default: output character
                 ctx.inline_buffer.append(self._escape_fn(char))
@@ -575,6 +646,17 @@ class FST:
             # Start inline code
             ctx.inline_buffer.append(HTML_CODE_OPEN)
             ctx.inline_state = State.IN_CODE
+        elif char == CHAR_LBRACKET:
+            # Potential link start [
+            ctx.inline_state = State.LINK_OPEN
+            ctx.link_text_buffer.clear()
+            ctx.link_url_buffer.clear()
+            ctx.link_text_formatting.clear()
+        elif char == CHAR_BANG:
+            # Potential image start !
+            ctx.inline_state = State.IMAGE_BANG
+            ctx.link_text_buffer.clear()
+            ctx.link_url_buffer.clear()
         else:
             ctx.inline_buffer.append(self._escape_fn(char))
     
@@ -693,6 +775,382 @@ class FST:
         else:
             # In code, we still escape for XSS safety but no Markdown formatting
             ctx.inline_buffer.append(self._escape_fn(char))
+    
+    # =========================================================================
+    # Link Methods [text](url) - DRY: shares URL helper with images
+    # =========================================================================
+    
+    def _inline_link_open(self, ctx: FSTContext, char: str) -> None:
+        """Process character after seeing [ (potential link start)."""
+        if char == CHAR_RBRACKET:
+            # Empty link text [] - not a valid link, output literally
+            ctx.inline_buffer.append(CHAR_LBRACKET)
+            ctx.inline_buffer.append(CHAR_RBRACKET)
+            ctx.inline_state = State.TEXT
+        elif char == CHAR_NEWLINE:
+            # Newline breaks link - output [ and the newline
+            ctx.inline_buffer.append(CHAR_LBRACKET)
+            ctx.inline_state = State.TEXT
+            # Don't append newline here, let block handle it
+        else:
+            # Start collecting link text
+            ctx.inline_state = State.LINK_TEXT
+            ctx.link_text_buffer.clear()
+            ctx.link_text_formatting.clear()
+            if char == CHAR_STAR:
+                # Potential formatting in link text
+                ctx.inline_state = State.LINK_TEXT_STAR_ONE
+            else:
+                ctx.link_text_buffer.append(self._escape_fn(char))
+    
+    def _inline_link_text(self, ctx: FSTContext, char: str) -> None:
+        """Process character while collecting link text."""
+        if char == CHAR_RBRACKET:
+            # End of link text - wait for (
+            ctx.inline_state = State.LINK_TEXT_CLOSE
+        elif char == CHAR_STAR:
+            # Potential formatting
+            ctx.inline_state = State.LINK_TEXT_STAR_ONE
+        elif char == CHAR_NEWLINE:
+            # Newline breaks link - output all accumulated text
+            self._abort_link(ctx)
+        elif char == CHAR_LBRACKET:
+            # Nested [ - abort link, treat as literal
+            self._abort_link(ctx)
+            ctx.inline_buffer.append(CHAR_LBRACKET)
+        else:
+            ctx.link_text_buffer.append(self._escape_fn(char))
+    
+    def _inline_link_text_star_one(self, ctx: FSTContext, char: str) -> None:
+        """Process after * in link text."""
+        if char == CHAR_STAR:
+            # ** - start bold
+            ctx.link_text_buffer.append(HTML_STRONG_OPEN)
+            ctx.link_text_formatting.append("strong")
+            ctx.inline_state = State.LINK_TEXT_BOLD
+        elif char == CHAR_RBRACKET:
+            # * followed by ] - add * and close link text
+            ctx.link_text_buffer.append(CHAR_STAR)
+            ctx.inline_state = State.LINK_TEXT_CLOSE
+        elif char == CHAR_NEWLINE:
+            ctx.link_text_buffer.append(CHAR_STAR)
+            self._abort_link(ctx)
+        else:
+            # Single * - start italic
+            ctx.link_text_buffer.append(HTML_EM_OPEN)
+            ctx.link_text_formatting.append("em")
+            ctx.link_text_buffer.append(self._escape_fn(char))
+            ctx.inline_state = State.LINK_TEXT_ITALIC
+    
+    def _inline_link_text_star_two(self, ctx: FSTContext, char: str) -> None:
+        """Process after ** in link text (within bold)."""
+        if char == CHAR_STAR:
+            # *** - close bold
+            ctx.link_text_buffer.append(HTML_STRONG_CLOSE)
+            if ctx.link_text_formatting and ctx.link_text_formatting[-1] == "strong":
+                ctx.link_text_formatting.pop()
+            ctx.inline_state = State.LINK_TEXT
+        elif char == CHAR_RBRACKET:
+            # ** followed by ] - close bold and end link text
+            ctx.link_text_buffer.append(HTML_STRONG_CLOSE)
+            if ctx.link_text_formatting and ctx.link_text_formatting[-1] == "strong":
+                ctx.link_text_formatting.pop()
+            ctx.inline_state = State.LINK_TEXT_CLOSE
+        elif char == CHAR_NEWLINE:
+            self._abort_link(ctx)
+        else:
+            # ** closes bold
+            ctx.link_text_buffer.append(HTML_STRONG_CLOSE)
+            if ctx.link_text_formatting and ctx.link_text_formatting[-1] == "strong":
+                ctx.link_text_formatting.pop()
+            ctx.link_text_buffer.append(self._escape_fn(char))
+            ctx.inline_state = State.LINK_TEXT
+    
+    def _inline_link_text_italic(self, ctx: FSTContext, char: str) -> None:
+        """Process character while in italic within link text."""
+        if char == CHAR_STAR:
+            # * closes italic
+            ctx.link_text_buffer.append(HTML_EM_CLOSE)
+            if ctx.link_text_formatting and ctx.link_text_formatting[-1] == "em":
+                ctx.link_text_formatting.pop()
+            ctx.inline_state = State.LINK_TEXT
+        elif char == CHAR_RBRACKET:
+            # End link text (close italic first)
+            ctx.link_text_buffer.append(HTML_EM_CLOSE)
+            if ctx.link_text_formatting and ctx.link_text_formatting[-1] == "em":
+                ctx.link_text_formatting.pop()
+            ctx.inline_state = State.LINK_TEXT_CLOSE
+        elif char == CHAR_NEWLINE:
+            self._abort_link(ctx)
+        else:
+            ctx.link_text_buffer.append(self._escape_fn(char))
+    
+    def _inline_link_text_bold(self, ctx: FSTContext, char: str) -> None:
+        """Process character while in bold within link text."""
+        if char == CHAR_STAR:
+            # Potential close
+            ctx.inline_state = State.LINK_TEXT_STAR_TWO
+        elif char == CHAR_RBRACKET:
+            # End link text (close bold first)
+            ctx.link_text_buffer.append(HTML_STRONG_CLOSE)
+            if ctx.link_text_formatting and ctx.link_text_formatting[-1] == "strong":
+                ctx.link_text_formatting.pop()
+            ctx.inline_state = State.LINK_TEXT_CLOSE
+        elif char == CHAR_NEWLINE:
+            self._abort_link(ctx)
+        else:
+            ctx.link_text_buffer.append(self._escape_fn(char))
+    
+    def _inline_link_text_close(self, ctx: FSTContext, char: str) -> None:
+        """Process character after ] (expecting ( for URL)."""
+        if char == CHAR_LPAREN:
+            # Valid link syntax [text](
+            ctx.inline_state = State.LINK_URL_OPEN
+            ctx.link_url_buffer.clear()
+        else:
+            # Not a link - output [text] literally (including the ])
+            ctx.inline_buffer.append(CHAR_LBRACKET)
+            # Close any open formatting
+            for fmt in reversed(ctx.link_text_formatting):
+                if fmt == "em":
+                    ctx.link_text_buffer.append(HTML_EM_CLOSE)
+                elif fmt == "strong":
+                    ctx.link_text_buffer.append(HTML_STRONG_CLOSE)
+            ctx.inline_buffer.extend(ctx.link_text_buffer)
+            ctx.inline_buffer.append(CHAR_RBRACKET)  # Add the closing bracket
+            ctx.link_text_buffer.clear()
+            ctx.link_url_buffer.clear()
+            ctx.link_text_formatting.clear()
+            ctx.inline_state = State.TEXT
+            # Process current char through normal text handling
+            self._inline_text(ctx, char)
+    
+    def _inline_link_url_open(self, ctx: FSTContext, char: str) -> None:
+        """Process first character of URL."""
+        if char == CHAR_RPAREN:
+            # Empty URL [text]() - still valid, creates link with empty href
+            self._complete_link(ctx)
+        elif char == CHAR_NEWLINE:
+            # Newline breaks link
+            self._abort_link_with_parens(ctx)
+        else:
+            ctx.link_url_buffer.append(char)
+            ctx.inline_state = State.LINK_URL
+    
+    def _inline_link_url(self, ctx: FSTContext, char: str) -> None:
+        """Process character while collecting URL."""
+        if char == CHAR_RPAREN:
+            # End of URL
+            self._complete_link(ctx)
+        elif char == CHAR_NEWLINE:
+            # Newline breaks link
+            self._abort_link_with_parens(ctx)
+        else:
+            ctx.link_url_buffer.append(char)
+    
+    def _complete_link(self, ctx: FSTContext) -> None:
+        """Complete link and output HTML. Uses shared URL sanitization (DRY)."""
+        url = "".join(ctx.link_url_buffer)
+        text = "".join(ctx.link_text_buffer)
+        
+        # Sanitize URL using shared helper (DRY with images)
+        safe_mode = self._mode == OutputMode.SAFE
+        sanitized_url = sanitize_url(url, safe_mode)
+        
+        if safe_mode and not sanitized_url and url:
+            # URL was rejected as unsafe - output as plain text
+            ctx.inline_buffer.append(CHAR_LBRACKET)
+            ctx.inline_buffer.append(text)
+            ctx.inline_buffer.append(CHAR_RBRACKET)
+            ctx.inline_buffer.append(CHAR_LPAREN)
+            ctx.inline_buffer.append(self._escape_fn(url))
+            ctx.inline_buffer.append(CHAR_RPAREN)
+        else:
+            # Output link HTML
+            ctx.inline_buffer.append(HTML_A_OPEN_START)
+            ctx.inline_buffer.append(sanitized_url)
+            ctx.inline_buffer.append(HTML_A_OPEN_END)
+            ctx.inline_buffer.append(text)
+            ctx.inline_buffer.append(HTML_A_CLOSE)
+        
+        # Clear buffers and return to text state
+        ctx.link_text_buffer.clear()
+        ctx.link_url_buffer.clear()
+        ctx.link_text_formatting.clear()
+        ctx.inline_state = State.TEXT
+    
+    def _abort_link(self, ctx: FSTContext) -> None:
+        """Abort link parsing and output accumulated text literally."""
+        ctx.inline_buffer.append(CHAR_LBRACKET)
+        # Close any open formatting
+        for fmt in reversed(ctx.link_text_formatting):
+            if fmt == "em":
+                ctx.link_text_buffer.append(HTML_EM_CLOSE)
+            elif fmt == "strong":
+                ctx.link_text_buffer.append(HTML_STRONG_CLOSE)
+        ctx.inline_buffer.extend(ctx.link_text_buffer)
+        ctx.link_text_buffer.clear()
+        ctx.link_url_buffer.clear()
+        ctx.link_text_formatting.clear()
+        ctx.inline_state = State.TEXT
+    
+    def _abort_link_with_parens(self, ctx: FSTContext) -> None:
+        """Abort link parsing when we've already seen ( ."""
+        ctx.inline_buffer.append(CHAR_LBRACKET)
+        # Close any open formatting
+        for fmt in reversed(ctx.link_text_formatting):
+            if fmt == "em":
+                ctx.link_text_buffer.append(HTML_EM_CLOSE)
+            elif fmt == "strong":
+                ctx.link_text_buffer.append(HTML_STRONG_CLOSE)
+        ctx.inline_buffer.extend(ctx.link_text_buffer)
+        ctx.inline_buffer.append(CHAR_RBRACKET)
+        ctx.inline_buffer.append(CHAR_LPAREN)
+        ctx.inline_buffer.extend(ctx.link_url_buffer)
+        ctx.link_text_buffer.clear()
+        ctx.link_url_buffer.clear()
+        ctx.link_text_formatting.clear()
+        ctx.inline_state = State.TEXT
+    
+    # =========================================================================
+    # Image Methods ![alt](url) - DRY: shares URL helper with links
+    # =========================================================================
+    
+    def _inline_image_bang(self, ctx: FSTContext, char: str) -> None:
+        """Process character after ! (potential image start)."""
+        if char == CHAR_LBRACKET:
+            # Valid image start ![
+            ctx.inline_state = State.IMAGE_OPEN
+            ctx.link_text_buffer.clear()
+            ctx.link_url_buffer.clear()
+        else:
+            # Not an image - output ! and process char
+            ctx.inline_buffer.append(CHAR_BANG)
+            ctx.inline_state = State.TEXT
+            self._inline_text(ctx, char)
+    
+    def _inline_image_open(self, ctx: FSTContext, char: str) -> None:
+        """Process character after ![ (image alt text start)."""
+        if char == CHAR_RBRACKET:
+            # Empty alt text ![] - valid but unusual
+            ctx.inline_state = State.IMAGE_ALT_CLOSE
+        elif char == CHAR_NEWLINE:
+            # Newline breaks image
+            ctx.inline_buffer.append(CHAR_BANG)
+            ctx.inline_buffer.append(CHAR_LBRACKET)
+            ctx.inline_state = State.TEXT
+        else:
+            ctx.link_text_buffer.append(char)  # Don't escape alt text yet
+            ctx.inline_state = State.IMAGE_ALT
+    
+    def _inline_image_alt(self, ctx: FSTContext, char: str) -> None:
+        """Process character while collecting image alt text."""
+        if char == CHAR_RBRACKET:
+            # End of alt text
+            ctx.inline_state = State.IMAGE_ALT_CLOSE
+        elif char == CHAR_NEWLINE:
+            # Newline breaks image
+            self._abort_image(ctx)
+        elif char == CHAR_LBRACKET:
+            # Nested [ - abort
+            self._abort_image(ctx)
+            ctx.inline_buffer.append(CHAR_LBRACKET)
+        else:
+            ctx.link_text_buffer.append(char)
+    
+    def _inline_image_alt_close(self, ctx: FSTContext, char: str) -> None:
+        """Process character after ] in image (expecting ()."""
+        if char == CHAR_LPAREN:
+            # Valid image syntax ![alt](
+            ctx.inline_state = State.IMAGE_URL_OPEN
+            ctx.link_url_buffer.clear()
+        else:
+            # Not an image - output ![alt] literally (including the ])
+            ctx.inline_buffer.append(CHAR_BANG)
+            ctx.inline_buffer.append(CHAR_LBRACKET)
+            ctx.inline_buffer.extend([self._escape_fn(c) for c in ctx.link_text_buffer])
+            ctx.inline_buffer.append(CHAR_RBRACKET)  # Add the closing bracket
+            ctx.link_text_buffer.clear()
+            ctx.link_url_buffer.clear()
+            ctx.inline_state = State.TEXT
+            self._inline_text(ctx, char)
+    
+    def _inline_image_url_open(self, ctx: FSTContext, char: str) -> None:
+        """Process first character of image URL."""
+        if char == CHAR_RPAREN:
+            # Empty URL ![alt]() - still valid, creates img with empty src
+            self._complete_image(ctx)
+        elif char == CHAR_NEWLINE:
+            # Newline breaks image
+            self._abort_image_with_parens(ctx)
+        else:
+            ctx.link_url_buffer.append(char)
+            ctx.inline_state = State.IMAGE_URL
+    
+    def _inline_image_url(self, ctx: FSTContext, char: str) -> None:
+        """Process character while collecting image URL."""
+        if char == CHAR_RPAREN:
+            # End of URL
+            self._complete_image(ctx)
+        elif char == CHAR_NEWLINE:
+            # Newline breaks image
+            self._abort_image_with_parens(ctx)
+        else:
+            ctx.link_url_buffer.append(char)
+    
+    def _complete_image(self, ctx: FSTContext) -> None:
+        """Complete image and output HTML. Uses shared URL sanitization (DRY)."""
+        url = "".join(ctx.link_url_buffer)
+        alt = "".join(ctx.link_text_buffer)
+        
+        # Sanitize URL using shared helper (DRY with links)
+        safe_mode = self._mode == OutputMode.SAFE
+        sanitized_url = sanitize_url(url, safe_mode)
+        
+        if safe_mode and not sanitized_url and url:
+            # URL was rejected as unsafe - output as plain text
+            ctx.inline_buffer.append(CHAR_BANG)
+            ctx.inline_buffer.append(CHAR_LBRACKET)
+            ctx.inline_buffer.append(self._escape_fn(alt))
+            ctx.inline_buffer.append(CHAR_RBRACKET)
+            ctx.inline_buffer.append(CHAR_LPAREN)
+            ctx.inline_buffer.append(self._escape_fn(url))
+            ctx.inline_buffer.append(CHAR_RPAREN)
+        else:
+            # Output image HTML
+            # Escape alt text for attribute context
+            escaped_alt = self._escape_fn(alt) if self._mode == OutputMode.SAFE else alt
+            ctx.inline_buffer.append(HTML_IMG_START)
+            ctx.inline_buffer.append(sanitized_url)
+            ctx.inline_buffer.append(HTML_IMG_ALT)
+            ctx.inline_buffer.append(escaped_alt)
+            ctx.inline_buffer.append(HTML_IMG_END)
+        
+        # Clear buffers and return to text state
+        ctx.link_text_buffer.clear()
+        ctx.link_url_buffer.clear()
+        ctx.inline_state = State.TEXT
+    
+    def _abort_image(self, ctx: FSTContext) -> None:
+        """Abort image parsing and output accumulated text literally."""
+        ctx.inline_buffer.append(CHAR_BANG)
+        ctx.inline_buffer.append(CHAR_LBRACKET)
+        ctx.inline_buffer.extend([self._escape_fn(c) for c in ctx.link_text_buffer])
+        ctx.link_text_buffer.clear()
+        ctx.link_url_buffer.clear()
+        ctx.inline_state = State.TEXT
+    
+    def _abort_image_with_parens(self, ctx: FSTContext) -> None:
+        """Abort image parsing when we've already seen ( ."""
+        ctx.inline_buffer.append(CHAR_BANG)
+        ctx.inline_buffer.append(CHAR_LBRACKET)
+        ctx.inline_buffer.extend([self._escape_fn(c) for c in ctx.link_text_buffer])
+        ctx.inline_buffer.append(CHAR_RBRACKET)
+        ctx.inline_buffer.append(CHAR_LPAREN)
+        ctx.inline_buffer.extend([self._escape_fn(c) for c in ctx.link_url_buffer])
+        ctx.link_text_buffer.clear()
+        ctx.link_url_buffer.clear()
+        ctx.inline_state = State.TEXT
     
     # =========================================================================
     # Code Block Methods (```)
@@ -889,6 +1347,60 @@ class FST:
             case State.IN_CODE:
                 # Close unclosed inline code
                 ctx.inline_buffer.append(HTML_CODE_CLOSE)
+            
+            # Link states - abort and output literally
+            case State.LINK_OPEN:
+                ctx.inline_buffer.append(CHAR_LBRACKET)
+            
+            case State.LINK_TEXT | State.LINK_TEXT_STAR_ONE | State.LINK_TEXT_STAR_TWO | State.LINK_TEXT_ITALIC | State.LINK_TEXT_BOLD:
+                ctx.inline_buffer.append(CHAR_LBRACKET)
+                # Close any open formatting in link text
+                for fmt in reversed(ctx.link_text_formatting):
+                    if fmt == "em":
+                        ctx.link_text_buffer.append(HTML_EM_CLOSE)
+                    elif fmt == "strong":
+                        ctx.link_text_buffer.append(HTML_STRONG_CLOSE)
+                ctx.inline_buffer.extend(ctx.link_text_buffer)
+            
+            case State.LINK_TEXT_CLOSE:
+                ctx.inline_buffer.append(CHAR_LBRACKET)
+                ctx.inline_buffer.extend(ctx.link_text_buffer)
+                ctx.inline_buffer.append(CHAR_RBRACKET)
+            
+            case State.LINK_URL_OPEN | State.LINK_URL:
+                ctx.inline_buffer.append(CHAR_LBRACKET)
+                ctx.inline_buffer.extend(ctx.link_text_buffer)
+                ctx.inline_buffer.append(CHAR_RBRACKET)
+                ctx.inline_buffer.append(CHAR_LPAREN)
+                ctx.inline_buffer.extend([self._escape_fn(c) for c in ctx.link_url_buffer])
+            
+            # Image states - abort and output literally
+            case State.IMAGE_BANG:
+                ctx.inline_buffer.append(CHAR_BANG)
+            
+            case State.IMAGE_OPEN | State.IMAGE_ALT:
+                ctx.inline_buffer.append(CHAR_BANG)
+                ctx.inline_buffer.append(CHAR_LBRACKET)
+                ctx.inline_buffer.extend([self._escape_fn(c) for c in ctx.link_text_buffer])
+            
+            case State.IMAGE_ALT_CLOSE:
+                ctx.inline_buffer.append(CHAR_BANG)
+                ctx.inline_buffer.append(CHAR_LBRACKET)
+                ctx.inline_buffer.extend([self._escape_fn(c) for c in ctx.link_text_buffer])
+                ctx.inline_buffer.append(CHAR_RBRACKET)
+            
+            case State.IMAGE_URL_OPEN | State.IMAGE_URL:
+                ctx.inline_buffer.append(CHAR_BANG)
+                ctx.inline_buffer.append(CHAR_LBRACKET)
+                ctx.inline_buffer.extend([self._escape_fn(c) for c in ctx.link_text_buffer])
+                ctx.inline_buffer.append(CHAR_RBRACKET)
+                ctx.inline_buffer.append(CHAR_LPAREN)
+                ctx.inline_buffer.extend([self._escape_fn(c) for c in ctx.link_url_buffer])
+        
+        # Clear link/image buffers
+        ctx.link_text_buffer.clear()
+        ctx.link_url_buffer.clear()
+        ctx.link_text_formatting.clear()
         
         # Output the buffer
         if ctx.inline_buffer:

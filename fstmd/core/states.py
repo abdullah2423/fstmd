@@ -81,6 +81,25 @@ class State(IntEnum):
     
     # Inline code states (`code`)
     IN_CODE: int = auto()
+    
+    # Link states [text](url)
+    LINK_OPEN: int = auto()           # Seen [
+    LINK_TEXT: int = auto()           # Collecting link text
+    LINK_TEXT_STAR_ONE: int = auto()  # Seen * in link text
+    LINK_TEXT_STAR_TWO: int = auto()  # Seen ** in link text
+    LINK_TEXT_ITALIC: int = auto()    # In italic within link text
+    LINK_TEXT_BOLD: int = auto()      # In bold within link text
+    LINK_TEXT_CLOSE: int = auto()     # Seen ]
+    LINK_URL_OPEN: int = auto()       # Seen (
+    LINK_URL: int = auto()            # Collecting URL
+    
+    # Image states ![alt](url)
+    IMAGE_BANG: int = auto()          # Seen !
+    IMAGE_OPEN: int = auto()          # Seen ![
+    IMAGE_ALT: int = auto()           # Collecting alt text
+    IMAGE_ALT_CLOSE: int = auto()     # Seen ]
+    IMAGE_URL_OPEN: int = auto()      # Seen (
+    IMAGE_URL: int = auto()           # Collecting URL
 
 
 class BlockState(IntEnum):
@@ -176,6 +195,11 @@ CHAR_AMP: Final[str] = "&"
 CHAR_QUOT: Final[str] = '"'
 CHAR_APOS: Final[str] = "'"
 CHAR_BACKTICK: Final[str] = "`"
+CHAR_LBRACKET: Final[str] = "["
+CHAR_RBRACKET: Final[str] = "]"
+CHAR_LPAREN: Final[str] = "("
+CHAR_RPAREN: Final[str] = ")"
+CHAR_BANG: Final[str] = "!"
 
 # Maximum lookahead buffer size
 MAX_LOOKAHEAD: Final[int] = 3

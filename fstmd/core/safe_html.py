@@ -232,3 +232,93 @@ def is_safe(text: str) -> bool:
     Check if text is safe (contains no dangerous patterns).
     """
     return not HTMLEscaper.contains_dangerous_pattern(text)
+
+
+# =========================================================================
+# URL Sanitization for Links and Images (DRY helper)
+# =========================================================================
+
+# Dangerous URL protocols that could lead to XSS
+DANGEROUS_PROTOCOLS: Final[tuple[str, ...]] = (
+    "javascript:",
+    "vbscript:",
+    "data:",
+)
+
+# Safe protocols whitelist for strict mode
+SAFE_PROTOCOLS: Final[tuple[str, ...]] = (
+    "http://",
+    "https://",
+    "mailto:",
+    "tel:",
+    "ftp://",
+    "#",  # Anchor links
+    "/",  # Relative paths
+)
+
+
+def is_safe_url(url: str) -> bool:
+    """
+    Check if a URL is safe for use in href/src attributes.
+    
+    Rejects dangerous protocols like javascript:, data:, vbscript:.
+    This is the shared helper for both links and images (DRY).
+    
+    Args:
+        url: The URL to check
+        
+    Returns:
+        True if URL is safe, False if it contains dangerous protocols
+    """
+    if not url:
+        return True  # Empty URL is safe (just won't link anywhere)
+    
+    # Normalize for case-insensitive check
+    url_lower = url.lower().strip()
+    
+    # Check for dangerous protocols
+    for protocol in DANGEROUS_PROTOCOLS:
+        if url_lower.startswith(protocol):
+            return False
+    
+    # Additional check: reject URLs with encoded dangerous protocols
+    # e.g., "java&#115;cript:" or "javascript&#58;"
+    # After decoding, these would be dangerous
+    url_decoded = url_lower.replace("&#", "").replace(";", "")
+    for protocol in ("javascript", "vbscript", "data"):
+        if protocol in url_decoded:
+            # Additional paranoid check - reject if protocol name appears
+            # This catches things like "java script:" with spaces
+            protocol_no_space = protocol.replace(" ", "")
+            url_no_space = url_lower.replace(" ", "").replace("\t", "")
+            if url_no_space.startswith(protocol_no_space + ":"):
+                return False
+    
+    return True
+
+
+def sanitize_url(url: str, safe_mode: bool = True) -> str:
+    """
+    Sanitize a URL for use in HTML attributes.
+    
+    In safe mode, dangerous URLs are replaced with empty string.
+    The URL is also escaped for HTML attribute context.
+    
+    This is the shared sanitizer for links and images (DRY).
+    
+    Args:
+        url: The URL to sanitize
+        safe_mode: If True, reject dangerous URLs; if False, pass through
+        
+    Returns:
+        Sanitized URL safe for use in href/src attributes
+    """
+    if not url:
+        return ""
+    
+    # In safe mode, reject dangerous URLs
+    if safe_mode and not is_safe_url(url):
+        return ""
+    
+    # Escape for HTML attribute context
+    return HTMLEscaper.escape_attribute(url)
