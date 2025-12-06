@@ -127,6 +127,9 @@ class FSTContext:
     table_row_buffer: list[str]          # Current row cells
     table_cell_buffer: list[str]         # Current cell content
     table_has_body: bool                 # Whether we've seen body rows
+    
+    # Task list state - number of characters to skip after checkbox detection
+    task_list_skip_count: int
 
 
 # HTML output constants
@@ -156,6 +159,10 @@ HTML_A_CLOSE: Final[str] = "</a>"
 HTML_IMG_START: Final[str] = '<img src="'
 HTML_IMG_ALT: Final[str] = '" alt="'
 HTML_IMG_END: Final[str] = '"/>'
+
+# Task list (checkbox) HTML constants
+HTML_CHECKBOX_CHECKED: Final[str] = '<input type="checkbox" checked /> '
+HTML_CHECKBOX_UNCHECKED: Final[str] = '<input type="checkbox" /> '
 
 # Table HTML constants
 HTML_TABLE_OPEN: Final[str] = "<table>"
@@ -264,6 +271,8 @@ class FST:
             table_row_buffer=[],
             table_cell_buffer=[],
             table_has_body=False,
+            # Task list state
+            task_list_skip_count=0,
         )
     
     def process(self, text: str) -> str:
@@ -293,6 +302,12 @@ class FST:
         n = len(text)
         
         while i < n:
+            # Check for task list skip (used after checkbox detection)
+            if ctx.task_list_skip_count > 0:
+                ctx.task_list_skip_count -= 1
+                i += 1
+                continue
+            
             char = text[i]
             
             # Update position tracking
@@ -1470,6 +1485,19 @@ class FST:
         if char == CHAR_SPACE:
             # Valid list item marker
             self._start_nested_list_item(ctx, "ul")
+            # Check for task list marker at pos+1: [x] or [ ] followed by space
+            # Pattern: [ ] or [x] or [X] followed by space (4 chars total)
+            if pos + 4 < length:
+                next_chars = text[pos + 1:pos + 5]
+                if next_chars == "[x] " or next_chars == "[X] ":
+                    # Checked task
+                    ctx.output.append(HTML_CHECKBOX_CHECKED)
+                    # Skip 4 characters: [, x, ], space
+                    ctx.task_list_skip_count = 4
+                elif next_chars == "[ ] ":
+                    # Unchecked task
+                    ctx.output.append(HTML_CHECKBOX_UNCHECKED)
+                    ctx.task_list_skip_count = 4
             ctx.block_state = BlockState.NESTED_LIST_CONTENT
         else:
             # Not a valid list marker - treat as paragraph

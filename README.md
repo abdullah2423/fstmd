@@ -53,6 +53,7 @@ print(html)
 | Unordered Lists | `- item` or `* item` | `<ul><li>item</li></ul>` |
 | Ordered Lists | `1. item` | `<ol><li>item</li></ol>` |
 | Nested Lists | Indented `- item` | Nested `<ul>`/`<ol>` elements |
+| Task Lists | `- [ ] item` or `- [x] item` | `<input type="checkbox"/>` |
 | Blockquotes | `> quote` | `<blockquote>...</blockquote>` |
 | Nested Blockquotes | `>> nested` | Nested `<blockquote>` elements |
 | Fenced Code Blocks | ` ``` ` | `<pre><code>...</code></pre>` |
@@ -138,6 +139,32 @@ aligned = """| Left | Center | Right |
 md.render(aligned)
 # Uses style="text-align:left|center|right" on cells
 ```
+
+### Task Lists
+
+FSTMD supports GitHub-style task lists (checkboxes) within list items:
+
+```python
+md = Markdown(mode="safe")
+
+# Unchecked task
+md.render("- [ ] Pending task")
+# Output: <ul><li><input type="checkbox" /> Pending task</li></ul>
+
+# Checked task (lowercase x or uppercase X)
+md.render("- [x] Completed task")
+# Output: <ul><li><input type="checkbox" checked /> Completed task</li></ul>
+
+# Mixed task list
+md.render("- [x] Done\n- [ ] Not done\n- [X] Also done")
+# Output: Three list items with appropriate checkbox states
+
+# Nested task lists
+md.render("- [x] Parent task\n  - [ ] Child task")
+# Output: Nested lists with checkboxes preserved at each level
+```
+
+Task lists work with both `-` and `*` list markers.
 
 ## API Reference
 
@@ -413,7 +440,6 @@ FSTMD focuses on speed and simplicity. It does **not** support:
 - Footnotes
 - HTML pass-through in safe mode
 - Language-specific syntax highlighting for code blocks
-- Task lists (`- [ ] item`)
 
 For full CommonMark compliance, use [markdown-it-py](https://github.com/executablebooks/markdown-it-py).
 
@@ -467,6 +493,7 @@ fstmd/
     ├── test_images.py   # Image formatting & URL security tests
     ├── test_tables.py   # Table parsing tests
     ├── test_nested_lists.py  # Nested list tests
+    ├── test_task_lists.py   # Task list (checkbox) tests
     ├── test_security.py # XSS prevention tests
     ├── test_fsm.py      # FST engine tests
     └── test_integration.py  # Integration tests
